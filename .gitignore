@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+coverage/
+.vscode/
+apps/web/dist/
+apps/api/dist/
+generated/
+telephony-worker/worker.env

@@ -1,0 +1,16 @@
+[Unit]
+Description=Agentic Customer Support - Telephony Worker (FreeSWITCH/ESL bridge)
+After=network.target freeswitch.service
+Wants=freeswitch.service
+
+[Service]
+User=sip
+WorkingDirectory=/home/sip/agentic-support-telephony
+ExecStart=/usr/local/bin/node /home/sip/agentic-support-telephony/worker.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,659 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth / RBAC
+// ---------------------------------------------------------------------------
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  users           User[]
+  rolePermissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id")
+  permissionId String @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  passwordHash String     @map("password_hash")
+  name         String
+  roleId       String     @map("role_id")
+  status       UserStatus @default(ACTIVE)
+  lastLoginAt  DateTime?  @map("last_login_at")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  role               Role               @relation(fields: [roleId], references: [id])
+  ticketAssignments  TicketAssignment[]
+
+  @@index([roleId])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id          String   @id @default(cuid())
+  externalRef String?  @map("external_ref")
+  fullName    String   @map("full_name")
+  email       String?
+  phone       String?
+  language    String   @default("ar")
+  metadata    Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  conversations     Conversation[]
+  calls             Call[]
+  tickets           Ticket[]
+  callbacks         Callback[]
+  campaignContacts  CampaignContact[]
+
+  @@index([email])
+  @@index([phone])
+  @@map("customers")
+}
+
+// ---------------------------------------------------------------------------
+// AI Agents
+// ---------------------------------------------------------------------------
+
+enum AiAgentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model AiAgent {
+  id          String        @id @default(cuid())
+  name        String
+  description String?       @db.Text
+  status      AiAgentStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  configs       AgentConfig[]
+  conversations Conversation[]
+  calls         Call[]
+  campaigns     Campaign[]
+
+  @@map("ai_agents")
+}
+
+model AgentConfig {
+  id                   String   @id @default(cuid())
+  agentId              String   @map("agent_id")
+  version              Int      @default(1)
+  systemInstructions   String   @map("system_instructions") @db.Text
+  supportedLanguages   Json     @map("supported_languages")
+  voiceConfig          Json?    @map("voice_config")
+  personality          Json?
+  allowedTools         Json     @map("allowed_tools")
+  knowledgeBaseAccess  Boolean  @default(true) @map("knowledge_base_access")
+  escalationRules      Json?    @map("escalation_rules")
+  businessRules        Json?    @map("business_rules")
+  workingHours         Json?    @map("working_hours")
+  isActive             Boolean  @default(true) @map("is_active")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  agent AiAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@index([agentId])
+  @@map("agent_configs")
+}
+
+// ---------------------------------------------------------------------------
+// Calls (Phase 4)
+// ---------------------------------------------------------------------------
+
+enum CallDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum CallEscalationStatus {
+  NONE
+  ESCALATED
+  RESOLVED
+}
+
+enum CallTransport {
+  WEBRTC
+  PSTN
+}
+
+model Call {
+  id                String                @id @default(cuid())
+  customerId        String                @map("customer_id")
+  aiAgentId         String?               @map("ai_agent_id")
+  conversationId    String?               @unique @map("conversation_id")
+  direction         CallDirection
+  liveKitRoomName   String?               @map("livekit_room_name")
+  transport         CallTransport         @default(WEBRTC)
+  fromNumber        String?               @map("from_number")
+  toNumber          String?               @map("to_number")
+  providerCallUuid  String?               @unique @map("provider_call_uuid")
+  startTime         DateTime              @default(now()) @map("start_time")
+  endTime           DateTime?             @map("end_time")
+  durationSeconds   Int?                  @map("duration_seconds")
+  language          String?
+  intent            String?
+  outcome           String?
+  escalationStatus  CallEscalationStatus  @default(NONE) @map("escalation_status")
+  createdAt         DateTime              @default(now()) @map("created_at")
+  updatedAt         DateTime              @updatedAt @map("updated_at")
+
+  customer      Customer         @relation(fields: [customerId], references: [id])
+  aiAgent       AiAgent?         @relation(fields: [aiAgentId], references: [id])
+  conversation  Conversation?    @relation(fields: [conversationId], references: [id])
+  recording     CallRecording?
+  transcript    CallTranscript?
+  toolExecutions ToolExecution[]
+  campaignCalls CampaignCall[]
+  callbackRequest Callback?
+
+  @@index([customerId])
+  @@index([aiAgentId])
+  @@map("calls")
+}
+
+model CallRecording {
+  id              String   @id @default(cuid())
+  callId          String   @unique @map("call_id")
+  storageUrl      String   @map("storage_url")
+  format          String?
+  durationSeconds Int?     @map("duration_seconds")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@map("call_recordings")
+}
+
+model CallTranscript {
+  id        String   @id @default(cuid())
+  callId    String   @unique @map("call_id")
+  content   Json
+  createdAt DateTime @default(now()) @map("created_at")
+
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@map("call_transcripts")
+}
+
+// ---------------------------------------------------------------------------
+// Conversations (text + voice)
+// ---------------------------------------------------------------------------
+
+enum ConversationChannel {
+  TEXT
+  VOICE
+}
+
+enum ConversationState {
+  CALL_STARTED
+  AUTHENTICATING
+  AUTHENTICATED
+  LISTENING
+  PROCESSING
+  UNDERSTANDING_REQUEST
+  EXECUTING_ACTION
+  WAITING_FOR_TOOL
+  CONFIRMING_ACTION
+  RESOLVING
+  ESCALATING
+  CALLBACK_REQUESTED
+  CALL_ENDED
+}
+
+model Conversation {
+  id               String              @id @default(cuid())
+  customerId       String              @map("customer_id")
+  aiAgentId        String?             @map("ai_agent_id")
+  channel          ConversationChannel @default(TEXT)
+  state            ConversationState   @default(CALL_STARTED)
+  intent           String?
+  startedAt        DateTime            @default(now()) @map("started_at")
+  endedAt          DateTime?           @map("ended_at")
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  customer   Customer               @relation(fields: [customerId], references: [id])
+  aiAgent    AiAgent?               @relation(fields: [aiAgentId], references: [id])
+  messages   Message[]
+  summaries  ConversationSummary[]
+  tickets    Ticket[]
+  toolExecutions ToolExecution[]
+  callbacks  Callback[]
+  call       Call?
+
+  @@index([customerId])
+  @@index([aiAgentId])
+  @@index([state])
+  @@map("conversations")
+}
+
+enum MessageSender {
+  CUSTOMER
+  AI
+  SYSTEM
+  HUMAN_AGENT
+}
+
+model Message {
+  id             String        @id @default(cuid())
+  conversationId String        @map("conversation_id")
+  sender         MessageSender
+  content        String        @db.Text
+  toolCalls      Json?         @map("tool_calls")
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  conversation   Conversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  toolExecutions ToolExecution[]
+
+  @@index([conversationId])
+  @@map("messages")
+}
+
+model ConversationSummary {
+  id             String   @id @default(cuid())
+  conversationId String   @map("conversation_id")
+  summary        String   @db.Text
+  generatedAt    DateTime @default(now()) @map("generated_at")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@map("conversation_summaries")
+}
+
+// ---------------------------------------------------------------------------
+// Tickets
+// ---------------------------------------------------------------------------
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TicketStatus {
+  NEW
+  OPEN
+  IN_PROGRESS
+  WAITING_FOR_CUSTOMER
+  ESCALATED
+  RESOLVED
+  CLOSED
+}
+
+model Ticket {
+  id             String         @id @default(cuid())
+  ticketNumber   String         @unique @map("ticket_number")
+  customerId     String         @map("customer_id")
+  conversationId String?        @map("conversation_id")
+  category       String?
+  priority       TicketPriority @default(MEDIUM)
+  status         TicketStatus   @default(NEW)
+  description    String         @db.Text
+  aiSummary      String?        @map("ai_summary") @db.Text
+  resolution     String?        @db.Text
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  customer     Customer            @relation(fields: [customerId], references: [id])
+  conversation Conversation?       @relation(fields: [conversationId], references: [id])
+  messages     TicketMessage[]
+  assignments  TicketAssignment[]
+
+  @@index([customerId])
+  @@index([status])
+  @@map("tickets")
+}
+
+enum TicketMessageAuthorType {
+  CUSTOMER
+  AGENT
+  AI
+  SYSTEM
+}
+
+model TicketMessage {
+  id         String                  @id @default(cuid())
+  ticketId   String                  @map("ticket_id")
+  authorType TicketMessageAuthorType @map("author_type")
+  authorId   String?                 @map("author_id")
+  content    String                  @db.Text
+  createdAt  DateTime                @default(now()) @map("created_at")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("ticket_messages")
+}
+
+model TicketAssignment {
+  id           String    @id @default(cuid())
+  ticketId     String    @map("ticket_id")
+  userId       String    @map("user_id")
+  assignedAt   DateTime  @default(now()) @map("assigned_at")
+  unassignedAt DateTime? @map("unassigned_at")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id])
+
+  @@index([ticketId])
+  @@index([userId])
+  @@map("ticket_assignments")
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge base (Phase 3)
+// ---------------------------------------------------------------------------
+
+enum KnowledgeDocumentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model KnowledgeDocument {
+  id        String                  @id @default(cuid())
+  title     String
+  category  String?
+  content   String?                 @db.Text
+  sourceUrl String?                 @map("source_url")
+  status    KnowledgeDocumentStatus @default(DRAFT)
+  createdAt DateTime                @default(now()) @map("created_at")
+  updatedAt DateTime                @updatedAt @map("updated_at")
+
+  chunks KnowledgeChunk[]
+
+  @@map("knowledge_documents")
+}
+
+model KnowledgeChunk {
+  id         String   @id @default(cuid())
+  documentId String   @map("document_id")
+  content    String   @db.Text
+  chunkIndex Int      @map("chunk_index")
+  embedding  Json
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  document KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@map("knowledge_chunks")
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+model Tool {
+  id                  String   @id @default(cuid())
+  name                String   @unique
+  description         String   @db.Text
+  inputSchema         Json     @map("input_schema")
+  requiredPermission  String?  @map("required_permission")
+  isEnabled           Boolean  @default(true) @map("is_enabled")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  executions ToolExecution[]
+
+  @@map("tools")
+}
+
+enum ToolExecutionStatus {
+  SUCCESS
+  FAILURE
+}
+
+model ToolExecution {
+  id             String              @id @default(cuid())
+  toolId         String              @map("tool_id")
+  conversationId String?             @map("conversation_id")
+  messageId      String?             @map("message_id")
+  callId         String?             @map("call_id")
+  requestArgs    Json                @map("request_args")
+  resultData     Json?               @map("result_data")
+  status         ToolExecutionStatus
+  errorMessage   String?             @map("error_message") @db.Text
+  durationMs     Int?                @map("duration_ms")
+  executedAt     DateTime            @default(now()) @map("executed_at")
+
+  tool         Tool          @relation(fields: [toolId], references: [id])
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+  message      Message?      @relation(fields: [messageId], references: [id])
+  call         Call?         @relation(fields: [callId], references: [id])
+
+  @@index([toolId])
+  @@index([conversationId])
+  @@map("tool_executions")
+}
+
+// ---------------------------------------------------------------------------
+// Campaigns (Phase 5)
+// ---------------------------------------------------------------------------
+
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+}
+
+model Campaign {
+  id                   String         @id @default(cuid())
+  name                 String
+  aiAgentId            String?        @map("ai_agent_id")
+  startDate            DateTime       @map("start_date")
+  endDate              DateTime?      @map("end_date")
+  startTime            String?        @map("start_time")
+  endTime              String?        @map("end_time")
+  maxAttempts          Int            @default(3) @map("max_attempts")
+  retryIntervalMinutes Int            @default(60) @map("retry_interval_minutes")
+  script               String?        @db.Text
+  status               CampaignStatus @default(DRAFT)
+  createdAt            DateTime       @default(now()) @map("created_at")
+  updatedAt            DateTime       @updatedAt @map("updated_at")
+
+  aiAgent  AiAgent?          @relation(fields: [aiAgentId], references: [id])
+  contacts CampaignContact[]
+
+  @@map("campaigns")
+}
+
+enum CampaignContactStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+  FAILED
+}
+
+model CampaignContact {
+  id         String                 @id @default(cuid())
+  campaignId String                 @map("campaign_id")
+  customerId String                 @map("customer_id")
+  status        CampaignContactStatus  @default(PENDING)
+  attempts      Int                    @default(0)
+  lastAttemptAt DateTime?              @map("last_attempt_at")
+  createdAt     DateTime               @default(now()) @map("created_at")
+
+  campaign Campaign       @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  customer Customer       @relation(fields: [customerId], references: [id])
+  calls    CampaignCall[]
+
+  @@index([campaignId])
+  @@index([customerId])
+  @@map("campaign_contacts")
+}
+
+enum CampaignCallOutcome {
+  ANSWERED
+  NO_ANSWER
+  BUSY
+  CALLBACK_REQUESTED
+  RESOLVED
+  ESCALATED
+  FAILED
+}
+
+model CampaignCall {
+  id                 String              @id @default(cuid())
+  campaignContactId  String              @map("campaign_contact_id")
+  callId             String?             @map("call_id")
+  attemptNumber      Int                 @map("attempt_number")
+  outcome            CampaignCallOutcome
+  createdAt          DateTime            @default(now()) @map("created_at")
+
+  campaignContact CampaignContact @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
+  call            Call?           @relation(fields: [callId], references: [id])
+
+  @@index([campaignContactId])
+  @@map("campaign_calls")
+}
+
+// ---------------------------------------------------------------------------
+// Callbacks
+// ---------------------------------------------------------------------------
+
+enum CallbackStatus {
+  PENDING
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+model Callback {
+  id             String         @id @default(cuid())
+  customerId     String         @map("customer_id")
+  conversationId String?        @map("conversation_id")
+  callId         String?        @unique @map("call_id")
+  requestedDate  DateTime       @map("requested_date")
+  requestedTime  String         @map("requested_time")
+  reason         String?
+  status         CallbackStatus @default(PENDING)
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+  call         Call?         @relation(fields: [callId], references: [id])
+
+  @@index([customerId])
+  @@index([status])
+  @@map("callbacks")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+enum NotificationRecipientType {
+  USER
+  CUSTOMER
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  PUSH
+  IN_APP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model Notification {
+  id            String                    @id @default(cuid())
+  recipientType NotificationRecipientType @map("recipient_type")
+  recipientId   String                    @map("recipient_id")
+  channel       NotificationChannel
+  subject       String?
+  content       String                    @db.Text
+  status        NotificationStatus        @default(PENDING)
+  sentAt        DateTime?                 @map("sent_at")
+  createdAt     DateTime                  @default(now()) @map("created_at")
+
+  @@index([recipientType, recipientId])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Audit logs
+// ---------------------------------------------------------------------------
+
+enum AuditActorType {
+  CUSTOMER
+  USER
+  AI_AGENT
+  SYSTEM
+}
+
+model AuditLog {
+  id         String         @id @default(cuid())
+  requestId  String?        @map("request_id")
+  actorType  AuditActorType @map("actor_type")
+  actorId    String?        @map("actor_id")
+  action     String
+  entityType String?        @map("entity_type")
+  entityId   String?        @map("entity_id")
+  toolName   String?        @map("tool_name")
+  result     Json?
+  success    Boolean        @default(true)
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([actorType, actorId])
+  @@index([requestId])
+  @@map("audit_logs")
+}

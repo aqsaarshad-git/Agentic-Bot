@@ -1,0 +1,25 @@
+<!--
+  Reference copy of what's deployed at
+  /usr/local/freeswitch/conf/dialplan/public/10_acs_inbound.xml on the shared FreeSWITCH box
+  (192.168.5.133) — that box's /usr/local/freeswitch/conf is NOT version-controlled anywhere,
+  so this file exists purely for documentation/reproducibility, not because anything reads it
+  from this repo.
+
+  Scoped explicitly to this project's two DIDs (not a catch-all like "^.*$") specifically
+  because this FreeSWITCH instance is shared with other products on the same box — matching
+  worker.js's own INBOUND_DIDS filter as defense in depth, not a substitute for it (ESL event
+  subscriptions are still global regardless of dialplan scoping, which is why the filter in
+  worker.js's onInboundEvent() is the actually load-bearing check).
+
+  answer + park hands the channel straight to the telephony worker over ESL — CHANNEL_ANSWER is
+  exactly what onInboundEvent() in telephony-worker/worker.js is listening for, the same event
+  an outbound &park() answer produces, so both directions converge on one code path.
+-->
+<include>
+  <extension name="acs_inbound">
+    <condition field="destination_number" expression="^(04232534455|04232534456)$">
+      <action application="answer"/>
+      <action application="park"/>
+    </condition>
+  </extension>
+</include>
