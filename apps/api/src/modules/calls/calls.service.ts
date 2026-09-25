@@ -54,20 +54,39 @@ interface LanguageResolutionDiagnostics {
    *  returning; never actually absent by the time a caller sees it. */
   switchDetected?: boolean;
   finalLanguage?: 'en' | 'ar';
+  /** AUDIT INSTRUMENTATION ONLY (2026-09-25 gpuBoxQueue investigation — no behavior change):
+   *  the queueWait/call split each STT attempt already computes internally (see resolveTranscript)
+   *  but previously only console-logged, never persisted — closing the "console logs that vanish"
+   *  gap for the shared single-worker STT/TTS GPU queue's real contribution to STT latency. */
+  fastQueueWaitMs?: number;
+  fastCallMs?: number;
+  enQueueWaitMs?: number;
+  enCallMs?: number;
+  arQueueWaitMs?: number;
+  arCallMs?: number;
 }
 
 /**
- * Serializes access to the shared GPU box's Cohere STT + VoxCPM2 TTS endpoints — confirmed
- * live (2026-09-09) that both are served by the SAME single-worker Flask app: firing a
- * /transcribe request while a /speak_stream response is still being read fails the /transcribe
- * call outright (connection-level failure, not a slow response), and the reverse is presumably
- * just as true. This matters far more now that TTS synthesis runs fully in the background
- * rather than blocking the turn's own HTTP response (see streamChunksIncremental) — a customer
- * talking again while the agent is still speaking is completely normal usage, not an edge
- * case, so without this queue that would routinely 503 the customer's own next turn's STT.
- * `run()` queues callers FIFO rather than letting them collide; combined with aborting a
- * superseded TTS stream early (see bumpGeneration below), a barge-in still gets the shared
- * endpoint back quickly instead of waiting out the full remaining reply.
+ * Serializes same-modality access to the shared GPU box's Cohere STT / VoxCPM2 TTS endpoints.
+ *
+ * UPDATED (2026-09-25 gpuBoxQueue investigation): the assumption this class originally shipped
+ * with — that STT and TTS are served by the SAME single-worker Flask process and therefore must
+ * be serialized against EACH OTHER too — was confirmed true on 2026-09-09 but is no longer true.
+ * The shared server was redeployed (unannounced, by its own owner) on 2026-09-25 with separate
+ * locks: STT runs CPU-bound behind its own lock, TTS runs GPU-bound behind its own lock.
+ * Verified live, repeatedly, directly against the server: two concurrent STT calls collide
+ * (HTTP 409, as before) and two concurrent TTS calls collide (HTTP 409, as before), but a
+ * concurrent STT+TTS pair now runs genuinely simultaneously with no collision at all. A single
+ * shared instance of this class therefore serialized STT behind a trailing TTS stream (and vice
+ * versa) for no real reason — confirmed live to cost seconds (one real turn's STT was delayed
+ * 13s behind an abandoned reply's trailing TTS). CallsService now keeps ONE instance per
+ * modality (`sttQueue`, `ttsQueue`) instead of one shared instance, so STT-vs-STT and TTS-vs-TTS
+ * still queue FIFO exactly as before (that part of the original reasoning is still correct and
+ * must not change), while STT and TTS no longer wait on each other.
+ *
+ * This rests on a shared, externally-owned box's current behavior, which has already changed
+ * once without notice — see CohereArabicSttProvider/VoxCpm2TtsProvider's own 409 handling for
+ * the defensive signal that watches for this assumption breaking again.
  */
 // REMOVED (2026-09-15, customer request): the pre-cached "One moment, let me check that for
 // you" filler and its FILLER_TRIGGER_MS/FILLER_TEXT/messageMayNeedToolLookup gate are gone —
@@ -162,10 +181,13 @@ export class CallsService {
   // generation is superseded (see bumpGeneration), so the shared GPU box is freed up
   // immediately instead of finishing audio nobody wants anymore. See streamChunksIncremental.
   private readonly activeTtsAbort = new Map<string, AbortController>();
-  // Every real call to the shared GPU box's STT/TTS endpoints — across every conversation —
-  // funnels through this single queue. See the AsyncMutex doc comment above for why this has
-  // to be a hard cross-provider serialization, not just a per-conversation one.
-  private readonly gpuBoxQueue = new AsyncMutex();
+  // Every real STT call, across every conversation, funnels through this queue — and every real
+  // TTS call through this one. Split 2026-09-25 from a single shared `gpuBoxQueue` instance once
+  // live testing confirmed STT and TTS no longer need to serialize against EACH OTHER on the
+  // current shared server (see the AsyncMutex doc comment above). Each one alone is still a hard
+  // cross-conversation serialization — STT-vs-STT and TTS-vs-TTS both still collide server-side.
+  private readonly sttQueue = new AsyncMutex();
+  private readonly ttsQueue = new AsyncMutex();
 
   private bumpGeneration(conversationId: string): number {
     const next = (this.streamGeneration.get(conversationId) ?? 0) + 1;
@@ -282,6 +304,20 @@ export class CallsService {
         providerCallUuid: params.providerCallUuid,
       },
     });
+    // Fire-and-forget (2026-09-24 cold-start latency fix) — see OrchestratorService.
+    // primeQwenCache's own doc comment. Deliberately not awaited: the greeting still needs to
+    // play and the customer still needs to speak before their first real question even reaches
+    // Qwen, which is exactly the head start this exists to use.
+    //
+    // BUG FIX (2026-09-24, confirmed live — real PSTN calls never primed at all): must use
+    // conversation.aiAgentId, NOT params.aiAgentId — ConversationsService.create() silently
+    // falls back to the first ACTIVE agent when no aiAgentId is given (see its own
+    // implementation), which is exactly what every real PSTN call does (params.aiAgentId is
+    // undefined here for a real dial-out). Priming with the unresolved undefined input meant it
+    // early-returned and never fired on a single real call — confirmed via zero
+    // 'latency.cache_prime' audit rows across 3 real PSTN calls, all showing the full cold
+    // promptEvalDurationMs (~3.7s) on their first real Qwen call regardless.
+    this.orchestrator.primeQwenCache(conversation.aiAgentId, conversation.id, call.id).catch(() => {});
     return { call, conversation };
   }
 
@@ -347,6 +383,15 @@ export class CallsService {
     await this.logLatency(requestId, call.id, 'latency.stt', sttDurationMs, {
       mode: sttPath,
       resolvedLanguage: detectedLanguage,
+      // AUDIT INSTRUMENTATION ONLY (2026-09-25 gpuBoxQueue investigation — no behavior change):
+      // persists the queueWait/call split each STT attempt already computes (previously only
+      // console-logged, never queryable after the fact) — see LanguageResolutionDiagnostics.
+      fastQueueWaitMs: langDiag.fastQueueWaitMs,
+      fastCallMs: langDiag.fastCallMs,
+      enQueueWaitMs: langDiag.enQueueWaitMs,
+      enCallMs: langDiag.enCallMs,
+      arQueueWaitMs: langDiag.arQueueWaitMs,
+      arCallMs: langDiag.arCallMs,
     });
     // 2026-09-15 language-fix task, requirement 7: ONE clear, complete record per turn of how
     // the spoken language was resolved — previously this information was scattered across
@@ -562,7 +607,7 @@ export class CallsService {
       const ttsStartedAt = Date.now();
       let ttsResult: TtsResult | null = null;
       try {
-        ttsResult = await this.gpuBoxQueue.run(() =>
+        ttsResult = await this.ttsQueue.run(() =>
           this.tts.synthesize(firstChunk, { styleInstruction: EMOTION_TTS_STYLE[finalEmotion] }),
         );
       } catch (error) {
@@ -661,7 +706,7 @@ export class CallsService {
       chunkQueue.push(text);
       chunkQueue.close();
     } else {
-      const ttsResult = await this.gpuBoxQueue.run(() => this.tts.synthesize(text)).catch(() => null);
+      const ttsResult = await this.ttsQueue.run(() => this.tts.synthesize(text)).catch(() => null);
       if (ttsResult) {
         audioBase64 = ttsResult.audio.toString('base64');
         audioFormat = ttsResult.format;
@@ -754,7 +799,12 @@ export class CallsService {
         let pcmMaxGapMs = 0;
         let pcmLastAt = chunkRequestStartedAt;
         try {
-          await this.gpuBoxQueue.run(async () => {
+          await this.ttsQueue.run(async () => {
+            // AUDIT INSTRUMENTATION ONLY (2026-09-25 gpuBoxQueue investigation — no behavior
+            // change): time actually spent waiting for the (TTS-only, since 2026-09-25) mutex
+            // before this chunk's synthesis could even start, isolated from synthesis time
+            // itself — the TTS-side half of the same blind spot already closed for STT above.
+            const queueWaitMs = Date.now() - chunkRequestStartedAt;
             const stream = await this.tts.synthesizeStream!(
               chunkText,
               { styleInstruction: EMOTION_TTS_STYLE[emotionRef.current] },
@@ -772,6 +822,7 @@ export class CallsService {
                 await this.logLatency(requestId, callId, 'latency.tts_chunk', pcmNow - chunkRequestStartedAt, {
                   chunkIndex: thisChunkIndex,
                   chunkChars: chunkText.length,
+                  queueWaitMs,
                 });
               } else {
                 pcmMaxGapMs = Math.max(pcmMaxGapMs, pcmNow - pcmLastAt);
@@ -788,6 +839,7 @@ export class CallsService {
                   mode: 'streaming-ttfb',
                   chunkIndex: thisChunkIndex,
                   chunkChars: chunkText.length,
+                  queueWaitMs,
                 });
                 // Turn-relative: the number the whole Qwen-streaming feature exists to
                 // improve — from the moment the customer's audio was fully received (before
@@ -858,7 +910,7 @@ export class CallsService {
         // the moment it interrupted, so there's nothing left waiting on one.
         if (this.streamGeneration.get(conversationId) !== generation) return;
         try {
-          const ttsResult = await this.gpuBoxQueue.run(() =>
+          const ttsResult = await this.ttsQueue.run(() =>
             this.tts.synthesize(chunks[i], { styleInstruction: EMOTION_TTS_STYLE[emotion] }),
           );
           if (this.streamGeneration.get(conversationId) !== generation) return;
@@ -940,7 +992,7 @@ export class CallsService {
       // queue-wait/call-duration breakdown as the dual path below, so the fast path's own
       // ~620ms average can be sanity-checked against real numbers too.
       const enqueuedAt = Date.now();
-      const result = await this.gpuBoxQueue
+      const result = await this.sttQueue
         .run(async () => {
           const queueWaitMs = Date.now() - enqueuedAt;
           const callStartedAt = Date.now();
@@ -977,6 +1029,8 @@ export class CallsService {
       const suspectedSwitch = knownLanguage === 'en' ? /[؀-ۿ]{2,}/.test(text) : text.trim().length > 0 && !arabicScript.test(text);
       diagnostics.suspectedSwitch = suspectedSwitch;
       diagnostics.fastPathText = text;
+      diagnostics.fastQueueWaitMs = result?.queueWaitMs;
+      diagnostics.fastCallMs = result?.callMs;
 
       if (!suspectedSwitch && text) {
         return { text, language: knownLanguage, path: 'fast-single', diagnostics: { ...diagnostics, finalLanguage: knownLanguage, switchDetected: false } };
@@ -1009,12 +1063,13 @@ export class CallsService {
     // also has its own fallback so one failing (409, timeout, etc.) doesn't waste the
     // other's result.
     // AUDIT INSTRUMENTATION ONLY (2026-09-14 latency audit — no behavior change): breaks down
-    // where the slow path's time actually goes — time spent WAITING for the shared GPU-box
-    // mutex (queued behind other STT/TTS work) vs. the STT call's own real duration — since
-    // "the slow path takes ~4.5s" could mean either "Cohere itself is slow" or "this request
-    // sat behind unrelated work," and those have completely different fixes.
+    // where the slow path's time actually goes — time spent WAITING for the STT-only mutex
+    // (queued behind other STT work, since 2026-09-25 — see sttQueue's own doc comment) vs.
+    // the STT call's own real duration — since "the slow path takes ~4.5s" could mean either
+    // "Cohere itself is slow" or "this request sat behind unrelated work," and those have
+    // completely different fixes.
     const enEnqueuedAt = Date.now();
-    const enResult = await this.gpuBoxQueue
+    const enResult = await this.sttQueue
       .run(async () => {
         const queueWaitMs = Date.now() - enEnqueuedAt;
         const callStartedAt = Date.now();
@@ -1026,7 +1081,7 @@ export class CallsService {
         return null;
       });
     const arEnqueuedAt = Date.now();
-    const arResult = await this.gpuBoxQueue
+    const arResult = await this.sttQueue
       .run(async () => {
         const queueWaitMs = Date.now() - arEnqueuedAt;
         const callStartedAt = Date.now();
@@ -1041,6 +1096,10 @@ export class CallsService {
       `[LATENCY] dual-STT breakdown: en(queueWait=${enResult?.queueWaitMs ?? 'n/a'}ms call=${enResult?.callMs ?? 'n/a'}ms) ` +
         `ar(queueWait=${arResult?.queueWaitMs ?? 'n/a'}ms call=${arResult?.callMs ?? 'n/a'}ms)`,
     );
+    diagnostics.enQueueWaitMs = enResult?.queueWaitMs;
+    diagnostics.enCallMs = enResult?.callMs;
+    diagnostics.arQueueWaitMs = arResult?.queueWaitMs;
+    diagnostics.arCallMs = arResult?.callMs;
     if (!enResult && !arResult) {
       throw new ServiceUnavailableException('The speech-to-text service is temporarily unavailable.');
     }
@@ -1451,10 +1510,12 @@ export class CallsService {
       // options.abortAudio (used by the manual POST /calls/:id/end route only — see
       // CallsController) DOES bump the generation, aborting any still-streaming TTS for this
       // conversation. Confirmed live: hanging up manually while a long reply was still
-      // streaming left that synthesis running against the shared single-worker GPU box for up
-      // to a minute afterward, needlessly queueing (via gpuBoxQueue) every OTHER call's own
-      // STT/TTS behind audio nobody would ever hear — one real turn's STT was delayed 13s this
-      // way. The auto-ended-by-the-AI path never passes this, since that case's own goodbye
+      // streaming left that synthesis running against the shared GPU box for up to a minute
+      // afterward, needlessly queueing (via ttsQueue — this predates the 2026-09-25 STT/TTS
+      // queue split, back when it was one shared gpuBoxQueue) every OTHER call's own STT/TTS
+      // behind audio nobody would ever hear — one real turn's STT was delayed 13s this way,
+      // which the queue split now prevents regardless (STT no longer waits on TTS at all).
+      // The auto-ended-by-the-AI path never passes this, since that case's own goodbye
       // audio is exactly what must NOT be aborted.
       if (options?.abortAudio) {
         this.bumpGeneration(call.conversationId);

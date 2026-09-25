@@ -90,7 +90,7 @@ export function AdminLayout() {
           <span className="brand-mark">
             <ShieldCheck size={16} color="#fff" />
           </span>
-          Agentic Support
+          Barq Bank
         </div>
         <div className="admin-nav-scroll">
           {NAV_SECTIONS.map((section) => (

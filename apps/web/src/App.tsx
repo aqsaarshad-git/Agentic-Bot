@@ -20,6 +20,7 @@ import { CallbacksPage } from './admin/CallbacksPage';
 import { AnalyticsPage } from './admin/AnalyticsPage';
 import { ComingSoonPage } from './admin/ComingSoonPage';
 import { SupportPage } from './support/SupportPage';
+import { BankingAssistantPage } from './banking/BankingAssistantPage';
 
 function RequireAdmin({ children }: { children: JSX.Element }) {
   const { token, loading } = useAdminAuth();
@@ -73,6 +74,14 @@ export default function App() {
         element={
           <CustomerAuthProvider>
             <SupportPage />
+          </CustomerAuthProvider>
+        }
+      />
+      <Route
+        path="/banking/*"
+        element={
+          <CustomerAuthProvider>
+            <BankingAssistantPage />
           </CustomerAuthProvider>
         }
       />

@@ -86,7 +86,17 @@ const PCM_BYTES_PER_MS = 16;
 
 const MAX_SILENCE_STREAK = 2;
 const RECONNECT_DELAY_MS = 3_000;
-const SUBSCRIBED_EVENTS = 'CHANNEL_ANSWER CHANNEL_EXECUTE_COMPLETE CHANNEL_HANGUP CHANNEL_PARK';
+// CHANNEL_EXECUTE added (2026-09-24, real-phone latency investigation): previously only
+// CHANNEL_EXECUTE_COMPLETE was subscribed, so the only two timestamps we had for a playback were
+// "we asked FreeSWITCH to play" (the eslExecute() ack, logged as "playback start" — which per its
+// own doc comment only confirms FreeSWITCH ACCEPTED the command, not that audio is flowing) and
+// "it finished". Everything in between was an unmeasured black box despite a comment there
+// asserting "actual RTP begins within ms of this" — an assumption, never actually instrumented.
+// CHANNEL_EXECUTE fires when FreeSWITCH itself begins EXECUTING the app (i.e. genuinely starts
+// producing audio for the channel), giving a real, FreeSWITCH-reported "playback actually began"
+// timestamp to compare against the command-accepted one. Audit instrumentation only — nothing
+// about playback control flow changes.
+const SUBSCRIBED_EVENTS = 'CHANNEL_ANSWER CHANNEL_EXECUTE CHANNEL_EXECUTE_COMPLETE CHANNEL_HANGUP CHANNEL_PARK';
 
 function loadEnvFile(file) {
   if (!fs.existsSync(file)) return;
@@ -452,6 +462,15 @@ function onEvent(session, eventName, headers) {
       log(`[LATENCY] CHANNEL_ANSWER received (call:${session.callId}) at ${Date.now()}`);
       onAnswer(session).catch((err) => log(`onAnswer(${session.callId}) failed:`, err.message));
       break;
+    case 'CHANNEL_EXECUTE': {
+      // AUDIT INSTRUMENTATION ONLY (2026-09-24) — see SUBSCRIBED_EVENTS' doc comment. Only
+      // logged for 'playback' (the app this whole investigation cares about) — record/uuid_record
+      // also execute on this channel and would just be noise here.
+      if (headers['Application'] === 'playback') {
+        log(`[LATENCY] CHANNEL_EXECUTE playback (FreeSWITCH actually started it) turn ${session.turn} (call:${session.callId}) at ${Date.now()}`);
+      }
+      break;
+    }
     case 'CHANNEL_EXECUTE_COMPLETE': {
       const app = headers['Application'] || '';
       const idx = session.execWaiters.findIndex((w) => w.app === app);
@@ -492,6 +511,25 @@ async function onAnswer(session) {
   await eslBgapi(`uuid_setvar ${session.fsUuid} RECORD_READ_ONLY true`).catch((err) =>
     log(`failed to set RECORD_READ_ONLY on ${session.fsUuid}: ${err.message}`),
   );
+  // BUG FIX (2026-09-24, real-phone latency investigation): `enable_file_write_buffering`
+  // defaults to true in FreeSWITCH and is exactly the mechanism behind the bursty (not
+  // steady-per-RECORD_POLL_MS) file growth already noted above monitorRecording/monitorBargeIn
+  // ("confirmed live 2026-09-10... arrives in bursts of several seconds' worth of audio") — it
+  // batches recorded PCM in an internal buffer (SWITCH_DEFAULT_FILE_BUFFER_LEN) before ever
+  // calling write(), so our poll-the-growing-file VAD can only SEE trailing silence once that
+  // buffer happens to flush, not when it actually occurred. Confirmed against FreeSWITCH's own
+  // docs (developer.signalwire.com/.../enable_file_write_buffering): disabling it is the
+  // documented fix for exactly this "record app, need real-time access to the growing file"
+  // case. This does not touch RECORD_END_SILENCE_MS, the RMS thresholds, or FreeSWITCH's own
+  // record/uuid_record apps themselves — it only stops FreeSWITCH from sitting on already-
+  // recorded silence before our poller can act on it, which is a real, possibly multi-second
+  // contributor to physical-speech-end -> VAD-end-of-speech latency that up to now nothing in
+  // this codebase had actually eliminated (only worked around, per the comments above). Set
+  // once per call, before the first `record`/`uuid_record start` ever runs, same as
+  // RECORD_READ_ONLY.
+  await eslBgapi(`uuid_setvar ${session.fsUuid} enable_file_write_buffering false`).catch((err) =>
+    log(`failed to disable file write buffering on ${session.fsUuid}: ${err.message}`),
+  );
   try {
     // BUG FIX (2026-09-15 — "first hello sometimes not heard"): this used to be `await
     // callApi(...)` right here, meaning recording could not arm until a fresh HTTP round trip
@@ -500,12 +538,13 @@ async function onAnswer(session) {
     // genuinely slow, external network call directly in the critical path between "caller
     // answered" and "we're listening" — exactly the kind of gap a caller who says "hello"
     // immediately on pickup can speak into before it closes. The greeting lookup is now kicked
-    // off as early as possible (originate() below, or set to an instant no-op for inbound,
-    // which can never have a seeded greeting anyway — see handleInboundAnswer) and simply
+    // off as early as possible — in parallel with dialing for outbound (originate() below), or
+    // right at answer for inbound (handleInboundAnswer below, since every call now always gets a
+    // real greeting — see getGreetingAudio's doc comment in pstn-call.service.ts) — and simply
     // awaited here: for outbound calls it has almost always already resolved by the time the
     // callee actually answers (the ring itself takes seconds — far longer than one API round
-    // trip), and for inbound it resolves synchronously. Worst case (a very fast pickup) is no
-    // slower than before; typical case removes the entire network wait from this path.
+    // trip); inbound still pays that round trip since there's no ringing window to hide it in,
+    // but recording only arms after it resolves either way, so the agent always speaks first.
     const greeting = await session.greetingPromise;
     // AUDIT INSTRUMENTATION (2026-09-10, still useful post-fix): how long recording had to wait
     // on the greeting lookup — should now read ~0ms in the common case instead of a real
@@ -971,14 +1010,20 @@ async function handleInboundAnswer(fsUuid, headers) {
   });
 
   const session = newSession(fsUuid, callId);
-  // Deliberately NOT overriding session.greetingPromise here (unlike originate() above) — an
-  // inbound call's conversation is created fresh, right above, at the moment of answer, so
-  // there is no possible way for it to already contain a seeded AI greeting message (only the
-  // outbound campaign path ever seeds one, before dialing). newSession()'s default
-  // (Promise.resolve({audioBase64:null})) already reflects that with zero network round trip —
-  // see getGreetingAudio's own doc comment in pstn-call.service.ts for confirmation this is
-  // always the real answer for inbound. Part of the 2026-09-15 "first hello sometimes not
-  // heard" fix: removes a wasted API call from the inbound answer -> recording-armed path.
+  // BUG FIX (2026-09-23 — "agent should speak first"): getGreetingAudio now always seeds and
+  // synthesizes a standard opening line when the conversation has no pre-seeded script (see its
+  // own doc comment in pstn-call.service.ts) — that includes every inbound call, which never had
+  // one before. This used to be skipped here entirely (left at newSession()'s no-op default)
+  // under the old assumption that inbound calls could never have a greeting; now it has to
+  // actually ask, same as originate() does for outbound. There's no ringing window to hide the
+  // round trip in here (the call is already answered), so this does add one network+TTS round
+  // trip before the caller hears anything — but onAnswer() already awaits this promise before
+  // arming recording, so the ordering (agent speaks, then the caller is heard) is correct either
+  // way; never rejects (defaults to "no greeting" on failure), matching originate()'s contract.
+  session.greetingPromise = callApi(`/telephony/worker/calls/${callId}/greeting`, {}).catch((err) => {
+    log(`greeting fetch failed, call will proceed without one: ${err.message}`);
+    return { audioBase64: null };
+  });
   registerHandler(fsUuid, (eventName, hdrs) => onEvent(session, eventName, hdrs));
   await onAnswer(session);
 }

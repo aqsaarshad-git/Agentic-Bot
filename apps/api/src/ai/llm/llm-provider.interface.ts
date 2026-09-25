@@ -51,6 +51,14 @@ export interface LlmResponseStats {
    *  console log line — never persisted, so it couldn't be queried after the fact. */
   concurrentAtStart?: number;
   othersAtStart?: string;
+  /** How long this request sat waiting for the QwenConcurrencyGate before Ollama's fetch() was
+   *  even issued (2026-09-24, normal-turn latency fix) — near-zero when the gate was free,
+   *  otherwise the time another request (by priority/label — see othersAtStart) held it. This is
+   *  the piece concurrentAtStart/othersAtStart alone couldn't show: THAT another request was
+   *  also in flight, not how much it actually cost this one to wait its turn. */
+  gateWaitMs?: number;
+  /** The priority this request was actually queued with (see LlmGenerateOptions.priority). */
+  gatePriority?: 'high' | 'low';
   /** DIAGNOSTIC ONLY (2026-09-17) — the model name Ollama itself reports serving this request
    *  (its `model` field, e.g. "qwen3.5:4b") — lets a runner-identity mismatch (an unexpected
    *  model/quantization actually answering) show up in the same log instead of being assumed. */
@@ -92,6 +100,14 @@ export interface LlmGenerateOptions {
    *  ever genuinely in flight at the same time, not just that the model was slow in general.
    *  No effect on the request sent to Qwen itself. */
   label?: string;
+  /** Ordering against the QwenConcurrencyGate (2026-09-24, normal-turn latency fix) — the shared
+   *  Qwen instance only ever serves one request at a time, so this decides who goes first when
+   *  more than one caller wants it. 'high' (the default when omitted) is for anything
+   *  customer-facing/blocking on the critical path (the main reply, the language judge). 'low'
+   *  is for background work that must never make a customer wait or evict the main reply's
+   *  cached prompt context mid-flight (classification, summarization). See
+   *  qwen-concurrency-gate.ts for exactly how priority is arbitrated. */
+  priority?: 'high' | 'low';
 }
 
 export interface LlmProvider {

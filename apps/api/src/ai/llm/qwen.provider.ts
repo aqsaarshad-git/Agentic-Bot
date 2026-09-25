@@ -1,7 +1,9 @@
 import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { LlmGenerateOptions, LlmMessage, LlmProvider, LlmResponse, LlmResponseStats, LlmToolSchema } from './llm-provider.interface';
+import { QwenConcurrencyGate, QwenGatePriority } from './qwen-concurrency-gate';
 
 /**
  * Adapter for Qwen 3.5, served by Ollama (confirmed live deployment — see
@@ -21,6 +23,42 @@ import { LlmGenerateOptions, LlmMessage, LlmProvider, LlmResponse, LlmResponseSt
  * already a parsed object, not a JSON-encoded string.
  */
 const QWEN_TIMEOUT_MS = 90_000;
+
+// BUG FIX (2026-09-21, banking-domain tool-count regression): confirmed live — with the
+// banking domain's ~46 tool schemas now sent on every non-forced turn, promptEvalCount hit
+// 4095/4096 (the model's default context window), leaving ~0 tokens of budget for the
+// response itself and producing degenerate 1-token replies ("I") or empty completions with no
+// tool call at all. This is a client-request parameter (`options.num_ctx` on Ollama's native
+// `/api/chat`), not a change to the remote GPU box's own service/config — safe under the
+// "never modify the shared GPU box" constraint. The model (4.7B, Q4_K_M, ~3GB resident) has
+// ample VRAM headroom for a larger KV cache on its now-dedicated instance.
+//
+// RAISED AGAIN (2026-09-23, statement-email delivery feature): confirmed live — adding the new
+// send_statement_by_email tool plus longer tool descriptions and longer system instructions
+// pushed promptEvalCount to a consistent 6600-7300+ against the previous 8192 ceiling (81-89%
+// used), and a real regression test caught the symptom this same bug produces short of full
+// failure: Qwen forgetting to call get_beneficiaries for a known, existing beneficiary,
+// asking redundant questions instead, two runs in a row. Same root cause, same fix — this is
+// not a one-time budget, it's a ceiling that needs re-checking (via this exact
+// promptEvalCount audit-log field) every time tools/instructions grow, per this constant's own
+// prior note. 16384 restores comfortable headroom for the current tool count with room to
+// spare for future growth.
+const QWEN_NUM_CTX = 16384;
+
+// BUG FIX (2026-09-23, turn-1 latency spike): confirmed live — a real call's first turn hit
+// load_duration=11644ms (Ollama reloading the model into VRAM from cold) on top of the usual
+// dual-language-detection cost, pushing time-to-first-audio to 18s vs. ~1.5s on later turns of
+// the very next call (model still warm). This dedicated instance is already meant to hold the
+// model forever (see credentials_guidance: OLLAMA_KEEP_ALIVE=-1 is the whole reason this project
+// got its own instance instead of the shared/contended one) — -1 here just re-asserts that same
+// "never idle-evict" policy from the client on every request, in case anything (a GPU-box
+// restart, a dropped tunnel) ever reset it server-side. A periodic no-op warm-up ping (see
+// warmUp() below) re-sends this on its own short cadence so a reload after any such reset is
+// caught within minutes, instead of silently waiting for the next real customer call to eat that
+// ~11s cost. Neither of these touches the remote box's own config — both are per-request
+// parameters, safe under "never modify the shared GPU box".
+const QWEN_KEEP_ALIVE = -1;
+const QWEN_WARMUP_TIMEOUT_MS = 15_000;
 
 // AUDIT INSTRUMENTATION ONLY (2026-09-14 Qwen-contention investigation — no behavior change).
 // Module-level (not per-instance) since QwenProvider is a singleton for the whole process
@@ -65,6 +103,9 @@ export class QwenProvider implements LlmProvider {
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly model: string;
+  // One gate for the whole process (QwenProvider is a Nest singleton) — matches the one real
+  // Qwen/Ollama instance every caller shares. See qwen-concurrency-gate.ts.
+  private readonly gate = new QwenConcurrencyGate();
 
   constructor(private readonly config: ConfigService) {
     this.baseUrl = this.config.get<string>('llm.qwenBaseUrl') ?? '';
@@ -79,15 +120,22 @@ export class QwenProvider implements LlmProvider {
       );
     }
     const label = options?.label ?? 'unlabeled';
+    const priority: QwenGatePriority = options?.priority ?? 'high';
+    const gateWaitStartedAt = Date.now();
+    const release = await this.gate.acquire(priority);
+    const gateWaitMs = Date.now() - gateWaitStartedAt;
     const { id: qwenReqId, concurrentAtStart, othersAtStart } = beginQwenRequest(label);
     const qwenStartedAt = Date.now();
-    this.logger.log(`[QWEN] #${qwenReqId} (${label}) start concurrentAtStart=${concurrentAtStart} others=[${othersAtStart}]`);
+    this.logger.log(
+      `[QWEN] #${qwenReqId} (${label}) start priority=${priority} gateWaitMs=${gateWaitMs} concurrentAtStart=${concurrentAtStart} others=[${othersAtStart}]`,
+    );
 
     try {
       const body = {
         model: this.model,
         think: false,
         stream: false,
+        keep_alive: QWEN_KEEP_ALIVE,
         messages: messages.map((m) => ({
           role: m.role,
           content: m.content,
@@ -97,7 +145,7 @@ export class QwenProvider implements LlmProvider {
           type: 'function',
           function: { name: t.name, description: t.description, parameters: t.parameters },
         })),
-        ...(options?.maxTokens ? { options: { num_predict: options.maxTokens } } : {}),
+        options: { num_ctx: QWEN_NUM_CTX, ...(options?.maxTokens ? { num_predict: options.maxTokens } : {}) },
       };
 
       let res: Response;
@@ -134,7 +182,7 @@ export class QwenProvider implements LlmProvider {
       // DIAGNOSTIC ONLY (2026-09-17, no behavior change): merged onto every returned stats
       // object below so both call sites (tool_calls and content) get it without duplicating —
       // see LlmResponseStats' own doc comments for what these mean.
-      const diagStats = { concurrentAtStart, othersAtStart, model: json?.model };
+      const diagStats = { concurrentAtStart, othersAtStart, model: json?.model, gateWaitMs, gatePriority: priority };
 
       if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
         return {
@@ -153,6 +201,7 @@ export class QwenProvider implements LlmProvider {
       this.logger.log(
         `[QWEN] #${qwenReqId} (${label}) end duration=${Date.now() - qwenStartedAt}ms concurrentAtEnd=${concurrentAtEnd} others=[${othersAtEnd}]`,
       );
+      release();
     }
   }
 
@@ -185,16 +234,23 @@ export class QwenProvider implements LlmProvider {
       throw new ServiceUnavailableException('Qwen provider is selected but QWEN_BASE_URL is not configured.');
     }
     const label = options?.label ?? 'unlabeled';
+    const priority: QwenGatePriority = options?.priority ?? 'high';
+    const gateWaitStartedAt = Date.now();
+    const release = await this.gate.acquire(priority);
+    const gateWaitMs = Date.now() - gateWaitStartedAt;
     const { id: qwenReqId, concurrentAtStart, othersAtStart } = beginQwenRequest(label);
     const qwenStartedAt = Date.now();
     let firstTokenAt: number | null = null;
-    this.logger.log(`[QWEN] #${qwenReqId} (${label}) start concurrentAtStart=${concurrentAtStart} others=[${othersAtStart}]`);
+    this.logger.log(
+      `[QWEN] #${qwenReqId} (${label}) start priority=${priority} gateWaitMs=${gateWaitMs} concurrentAtStart=${concurrentAtStart} others=[${othersAtStart}]`,
+    );
 
     try {
     const body = {
       model: this.model,
       think: false,
       stream: true,
+      keep_alive: QWEN_KEEP_ALIVE,
       messages: messages.map((m) => ({
         role: m.role,
         content: m.content,
@@ -210,7 +266,7 @@ export class QwenProvider implements LlmProvider {
       // actual bound on generation length — a real gap given generateStream is what every real
       // PSTN/browser call actually uses (generate() is only the fallback). Mirrors generate()'s
       // own line exactly.
-      ...(options?.maxTokens ? { options: { num_predict: options.maxTokens } } : {}),
+      options: { num_ctx: QWEN_NUM_CTX, ...(options?.maxTokens ? { num_predict: options.maxTokens } : {}) },
     };
 
     let res: Response;
@@ -277,7 +333,14 @@ export class QwenProvider implements LlmProvider {
             // reflect the moment THIS request began (captured above, before the fetch), not
             // whatever else may be running by the time the stream finishes — that's the
             // question this whole phase needs answered, so it must be the start-time snapshot.
-            finalStats = { ...extractStats(parsed), concurrentAtStart, othersAtStart, model: parsed?.model };
+            finalStats = {
+              ...extractStats(parsed),
+              concurrentAtStart,
+              othersAtStart,
+              model: parsed?.model,
+              gateWaitMs,
+              gatePriority: priority,
+            };
           }
 
           const message = parsed?.message;
@@ -319,6 +382,7 @@ export class QwenProvider implements LlmProvider {
       this.logger.log(
         `[QWEN] #${qwenReqId} (${label}) end duration=${Date.now() - qwenStartedAt}ms concurrentAtEnd=${concurrentAtEnd} others=[${othersAtEnd}]`,
       );
+      release();
     }
   }
 
@@ -329,8 +393,51 @@ export class QwenProvider implements LlmProvider {
         'Summarize this customer support conversation in 1-2 sentences for a human agent taking over. ' +
         'Focus on what the customer wants and what has already been tried.',
     };
-    const result = await this.generate([summaryPrompt, ...messages], []);
+    const result = await this.generate([summaryPrompt, ...messages], [], { label: 'summary', priority: 'low' });
     return result.content?.trim() || 'No summary available.';
+  }
+
+  /**
+   * Periodic no-op ping so the model is never idle long enough for Ollama to evict it between
+   * real calls — see QWEN_KEEP_ALIVE's doc comment for why this exists. Every 5 minutes is
+   * comfortably inside the 30-minute keep_alive window this and every real request now request,
+   * so the model should never actually reach eviction from this alone; it only kicks in for real
+   * traffic gaps longer than that (rare, but exactly what caused the 18s turn-1 spike this fixes).
+   * An empty `messages` array is Ollama's documented way to preload/refresh a model's residency
+   * without running any actual generation — no tokens produced, no user-facing cost.
+   */
+  @Cron(CronExpression.EVERY_5_MINUTES)
+  async warmUp(): Promise<void> {
+    if (!this.baseUrl) return;
+    const startedAt = Date.now();
+    // Low priority, same gate as every other caller (2026-09-24 fix) — this must never jump
+    // ahead of or overlap with a real customer request; waiting an extra few seconds for the
+    // gate costs nothing here, since this only exists to stop the model idling out.
+    const release = await this.gate.acquire('low');
+    try {
+      const res = await fetch(`${this.baseUrl.replace(/\/$/, '')}/api/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+        },
+        body: JSON.stringify({ model: this.model, messages: [], keep_alive: QWEN_KEEP_ALIVE }),
+        signal: AbortSignal.timeout(QWEN_WARMUP_TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        this.logger.warn(`Qwen warm-up ping returned HTTP ${res.status}`);
+        return;
+      }
+      const json: any = await res.json().catch(() => null);
+      const loadDurationMs = typeof json?.load_duration === 'number' ? Math.round(json.load_duration / 1e6) : undefined;
+      this.logger.debug(`[QWEN] warm-up ping ok in ${Date.now() - startedAt}ms (loadDurationMs=${loadDurationMs ?? 'n/a'})`);
+    } catch (error) {
+      // Never let a warm-up failure surface anywhere near a real request — this is purely a
+      // latency optimization, not a health check the app depends on.
+      this.logger.warn(`Qwen warm-up ping failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      release();
+    }
   }
 
   /** Ollama's native API returns already-parsed argument objects; guard for a JSON string anyway. */

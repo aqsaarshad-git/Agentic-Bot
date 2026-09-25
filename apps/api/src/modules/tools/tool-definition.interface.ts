@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { AuthPrincipal } from '../../common/types/auth-principal';
+import { VerificationLevel } from './verification-level';
 
 export interface ToolExecutionContext {
   requestId?: string;
@@ -10,6 +11,12 @@ export interface ToolExecutionContext {
   callId?: string;
   /** Tool names the invoking AI agent's config allows — enforced by ToolRegistryService. */
   allowedTools: string[];
+  /**
+   * Computed fresh every turn by the orchestrator from VerificationService — never
+   * supplied by, or inferable from, the LLM. Enforced generically in
+   * ToolRegistryService.validateAndExecute against each tool's minVerificationLevel.
+   */
+  verificationLevel: VerificationLevel;
 }
 
 export interface ToolDefinition<TArgs = any, TResult = any> {
@@ -24,5 +31,12 @@ export interface ToolDefinition<TArgs = any, TResult = any> {
    * NOT be marked idempotent, since a blind retry could double the action.
    */
   idempotent?: boolean;
+  /** Minimum authorization tier required to invoke this tool. Defaults to AUTHENTICATED. */
+  minVerificationLevel?: VerificationLevel;
+  /**
+   * Argument keys that must never be persisted in plaintext (e.g. an OTP code) — redacted
+   * to '[REDACTED]' before ToolRegistryService writes requestArgs into tool_executions.
+   */
+  sensitiveArgs?: string[];
   handler: (ctx: ToolExecutionContext, args: TArgs) => Promise<TResult>;
 }

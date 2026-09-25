@@ -65,7 +65,7 @@ export function SupportPage() {
       <span className="brand-mark">
         <ShieldCheck size={18} />
       </span>
-      <span className="brand-name">Agentic Support</span>
+      <span className="brand-name">Barq Bank</span>
     </div>
   );
 
@@ -186,7 +186,7 @@ export function SupportPage() {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 18 }}>
           <div>
             <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-              Agentic Support
+              Barq Bank
             </div>
             <h2 style={{ marginTop: 2 }}>Hi {customer.fullName.split(' ')[0]}, how can we help?</h2>
           </div>

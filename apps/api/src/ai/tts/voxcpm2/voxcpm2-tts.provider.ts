@@ -75,6 +75,14 @@ export class VoxCpm2TtsProvider implements TtsProvider {
     }
 
     if (!res.ok) {
+      // DEFENSIVE SIGNAL (2026-09-25 gpuBoxQueue split) — see synthesizeStream's identical
+      // check below for what this is watching for.
+      if (res.status === 409) {
+        this.logger.error(
+          '[GPU-QUEUE-COLLISION] TTS got HTTP 409 (VoxCPM2 /speak) despite ttsQueue serializing our own ' +
+            'TTS calls — either ttsQueue has a bug, or the shared server changed its concurrency behavior again.',
+        );
+      }
       this.logger.error(`VoxCPM2 returned HTTP ${res.status}: ${await res.text().catch(() => '')}`);
       throw new ServiceUnavailableException('The text-to-speech service is temporarily unavailable.');
     }
@@ -124,6 +132,19 @@ export class VoxCpm2TtsProvider implements TtsProvider {
     }
 
     if (!res.ok || !res.body) {
+      // DEFENSIVE SIGNAL (2026-09-25 gpuBoxQueue split): ttsQueue is supposed to make a 409 here
+      // impossible from our own side (it already serializes every TTS call we make) — expected
+      // only if ttsQueue itself has a bug, or the shared server's concurrency behavior changed
+      // again (it already did once, unannounced, on 2026-09-25 — see calls.service.ts's
+      // AsyncMutex doc comment). Tagged distinctly so that's easy to spot instead of reading as
+      // a generic "TTS unavailable" blip. Not retried here — see the STT provider's identical
+      // note for why.
+      if (res.status === 409) {
+        this.logger.error(
+          '[GPU-QUEUE-COLLISION] TTS got HTTP 409 (VoxCPM2 /speak_stream) despite ttsQueue serializing our ' +
+            'own TTS calls — either ttsQueue has a bug, or the shared server changed its concurrency behavior again.',
+        );
+      }
       this.logger.error(`VoxCPM2 stream returned HTTP ${res.status}: ${await res.text().catch(() => '')}`);
       throw new ServiceUnavailableException('The text-to-speech service is temporarily unavailable.');
     }

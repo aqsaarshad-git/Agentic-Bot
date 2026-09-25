@@ -33,7 +33,7 @@ export function LoginPage() {
           <span className="brand-mark">
             <ShieldCheck size={18} />
           </span>
-          <span className="brand-name">Agentic Support</span>
+          <span className="brand-name">Barq Bank</span>
         </div>
         <h2 style={{ marginBottom: 4 }}>Welcome back</h2>
         <p style={{ margin: '0 0 22px', color: 'var(--text-muted)', fontSize: 13.5 }}>

@@ -245,6 +245,56 @@ h1, h2, h3 {
   margin-bottom: 20px;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 100;
+}
+
+.modal-card {
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 24px;
+  width: 100%;
+  max-width: 440px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.modal-header h3 {
+  margin: 0;
+}
+
+.modal-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: var(--surface-alt);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.modal-close:hover {
+  color: var(--text);
+}
+
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -627,6 +677,134 @@ select:focus {
 .chat-input-row .btn {
   margin: 6px;
   border-radius: var(--radius-sm);
+}
+
+/* ---------- Banking assistant page ---------- */
+
+.banking-shell {
+  display: flex;
+  gap: 18px;
+  width: 100%;
+  max-width: 1040px;
+  align-items: flex-start;
+}
+
+.banking-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.dev-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(217, 119, 6, 0.12);
+  color: #b45309;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.dev-panel {
+  width: 260px;
+  flex-shrink: 0;
+  background: var(--surface);
+  border: 1px dashed rgba(217, 119, 6, 0.4);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  font-size: 12.5px;
+}
+
+.dev-panel h4 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dev-panel dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 8px;
+}
+
+.dev-panel dt {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.dev-panel dd {
+  margin: 0;
+  text-align: right;
+  word-break: break-word;
+}
+
+.demo-customer-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+
+.demo-customer-grid button {
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.demo-customer-grid button:hover {
+  border-color: var(--accent);
+}
+
+.demo-customer-grid button strong {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.demo-customer-grid button span {
+  color: var(--text-muted);
+}
+
+.connection-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.connection-pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+}
+
+.connection-pill.online .dot {
+  background: var(--success);
+}
+
+.connection-pill.offline .dot {
+  background: var(--danger);
+}
+
+@media (max-width: 860px) {
+  .banking-shell {
+    flex-direction: column;
+  }
+  .dev-panel {
+    width: 100%;
+  }
 }
 
 /* ---------- Call widget ---------- */

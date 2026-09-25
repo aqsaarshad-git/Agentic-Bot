@@ -109,4 +109,49 @@ export class TicketsService {
     });
     return this.prisma.ticket.update({ where: { id }, data: { status: 'ESCALATED' } });
   }
+
+  /**
+   * Support cases (categories K + M — disputes/fraud, general complaints) reuse Ticket rather
+   * than a parallel model, since it already has everything a case needs. A fraud/transaction
+   * dispute is auto-escalated to URGENT priority and OPEN status regardless of what was passed
+   * in — it should never sit in NEW/unassigned while money is potentially at risk.
+   */
+  async createCase(params: {
+    customerId: string;
+    conversationId?: string;
+    category: string;
+    subcategory?: string;
+    description: string;
+    accountId?: string;
+    cardId?: string;
+    transactionId?: string;
+    disputeAmount?: number;
+  }) {
+    const isDispute = params.category === 'FRAUD_DISPUTE' || params.category === 'TRANSACTION_DISPUTE';
+    return this.prisma.ticket.create({
+      data: {
+        ticketNumber: this.generateTicketNumber(),
+        customerId: params.customerId,
+        conversationId: params.conversationId,
+        category: params.category,
+        subcategory: params.subcategory,
+        priority: isDispute ? 'URGENT' : 'MEDIUM',
+        status: isDispute ? 'OPEN' : 'NEW',
+        description: params.description,
+        aiSummary: params.description,
+        accountId: params.accountId,
+        cardId: params.cardId,
+        transactionId: params.transactionId,
+        disputeAmount: params.disputeAmount,
+      },
+    });
+  }
+
+  findAllForCustomer(customerId: string, params: { status?: TicketStatus; take?: number } = {}) {
+    return this.prisma.ticket.findMany({
+      where: { customerId, status: params.status },
+      orderBy: { createdAt: 'desc' },
+      take: params.take ?? 10,
+    });
+  }
 }

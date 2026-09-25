@@ -5,6 +5,20 @@ import { AuditService } from '../audit/audit.service';
 import { LlmToolSchema } from '../../ai/llm/llm-provider.interface';
 import { TOOL_DEFINITIONS } from './tool-definitions.provider';
 import { ToolDefinition, ToolExecutionContext } from './tool-definition.interface';
+import { InsufficientVerificationException, VerificationLevel, meetsLevel } from './verification-level';
+
+function redactArgs(args: unknown, sensitiveKeys: string[] | undefined): unknown {
+  if (!sensitiveKeys?.length || typeof args !== 'object' || args === null) {
+    return args;
+  }
+  const redacted: Record<string, unknown> = { ...(args as Record<string, unknown>) };
+  for (const key of sensitiveKeys) {
+    if (key in redacted) {
+      redacted[key] = '[REDACTED]';
+    }
+  }
+  return redacted;
+}
 
 @Injectable()
 export class ToolRegistryService implements OnModuleInit {
@@ -73,20 +87,62 @@ export class ToolRegistryService implements OnModuleInit {
       throw new BadRequestException(`Tool "${name}" is currently disabled`);
     }
 
+    const minLevel = def.minVerificationLevel ?? VerificationLevel.AUTHENTICATED;
+    if (!meetsLevel(ctx.verificationLevel, minLevel)) {
+      await this.recordExecution(
+        toolDbId,
+        name,
+        ctx,
+        redactArgs(rawArgs, def.sensitiveArgs),
+        undefined,
+        false,
+        'Insufficient verification level',
+        0,
+      );
+      throw new InsufficientVerificationException(minLevel, ctx.verificationLevel);
+    }
+
     const parsed = def.inputSchema.safeParse(rawArgs ?? {});
     if (!parsed.success) {
       const message = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
-      await this.recordExecution(toolDbId, name, ctx, rawArgs, undefined, false, message, Date.now() - startedAt);
+      await this.recordExecution(
+        toolDbId,
+        name,
+        ctx,
+        redactArgs(rawArgs, def.sensitiveArgs),
+        undefined,
+        false,
+        message,
+        Date.now() - startedAt,
+      );
       throw new BadRequestException(`Invalid arguments for tool "${name}": ${message}`);
     }
 
     try {
       const result = await this.executeWithRetry(def, ctx, parsed.data);
-      await this.recordExecution(toolDbId, name, ctx, parsed.data, result, true, undefined, Date.now() - startedAt);
+      await this.recordExecution(
+        toolDbId,
+        name,
+        ctx,
+        redactArgs(parsed.data, def.sensitiveArgs),
+        result,
+        true,
+        undefined,
+        Date.now() - startedAt,
+      );
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.recordExecution(toolDbId, name, ctx, parsed.data, undefined, false, message, Date.now() - startedAt);
+      await this.recordExecution(
+        toolDbId,
+        name,
+        ctx,
+        redactArgs(parsed.data, def.sensitiveArgs),
+        undefined,
+        false,
+        message,
+        Date.now() - startedAt,
+      );
       throw error;
     }
   }

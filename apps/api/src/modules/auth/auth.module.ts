@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
-import { NotificationsModule } from '../notifications/notifications.module';
+import { VerificationModule } from '../verification/verification.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './jwt.strategy';
@@ -17,7 +17,7 @@ const JwtModuleAsync = JwtModule.registerAsync({
 });
 
 @Module({
-  imports: [PassportModule, JwtModuleAsync, NotificationsModule],
+  imports: [PassportModule, JwtModuleAsync, VerificationModule],
   controllers: [AuthController],
   providers: [AuthService, JwtStrategy],
   exports: [AuthService, JwtModuleAsync],

@@ -1,39 +1,37 @@
 import { FactoryProvider, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { z } from 'zod';
 import { CustomersService } from '../customers/customers.service';
 import { TicketsService } from '../tickets/tickets.service';
 import { ConversationsService } from '../conversations/conversations.service';
 import { CallbacksService } from '../callbacks/callbacks.service';
-import { ToolDefinition, ToolExecutionContext } from './tool-definition.interface';
+import { AccountsService } from '../accounts/accounts.service';
+import { TransactionsService } from '../transactions/transactions.service';
+import { CardsService } from '../cards/cards.service';
+import { BeneficiariesService } from '../beneficiaries/beneficiaries.service';
+import { TransfersService } from '../transfers/transfers.service';
+import { StatementsService } from '../statements/statements.service';
+import { VerificationService } from '../verification/verification.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { PrismaService } from '../../database/prisma.service';
+import { ToolDefinition } from './tool-definition.interface';
+import { isCustomerSession, toJsonSchema } from './definitions/shared';
+import { buildAccountTools } from './definitions/account-tools';
+import { buildTransactionTools } from './definitions/transaction-tools';
+import { buildCardTools } from './definitions/card-tools';
+import { buildPinTools } from './definitions/pin-tools';
+import { buildPasswordTools } from './definitions/password-tools';
+import { buildBeneficiaryTools } from './definitions/beneficiary-tools';
+import { buildTransferTools } from './definitions/transfer-tools';
+import { buildVerificationTools } from './definitions/verification-tools';
+import { buildSupportCaseTools } from './definitions/support-case-tools';
+import { buildStatementTools } from './definitions/statement-tools';
 
 export const TOOL_DEFINITIONS = Symbol('TOOL_DEFINITIONS');
 
-/**
- * True unless this is an EXPLICITLY staff-authenticated session (ctx.actor?.type === 'user')
- * — restricted-to-own-data is the safe default, not something a session has to opt into.
- * This matters because CallsService (the voice pipeline) never passes an `actor` at all when
- * invoking the orchestrator — a call is inherently the customer's own, so there was nothing to
- * pass — meaning a check that only restricted when `actor?.type === 'customer'` would have
- * left EVERY voice call unrestricted (ctx.actor undefined there), missing exactly the pipeline
- * this was meant to protect. Only an explicit staff actor (chat sent via POST
- * /conversations/:id/messages by an ADMIN/AGENT/SUPERVISOR) gets the broader lookup access,
- * matching their existing RBAC-gated REST access to any customer's data elsewhere in the app.
- */
-function isCustomerSession(ctx: ToolExecutionContext): boolean {
-  return ctx.actor?.type !== 'user';
-}
-
-function toJsonSchema(shape: Record<string, { type: string; description: string; enum?: string[] }>, required: string[]) {
-  return {
-    type: 'object',
-    properties: Object.fromEntries(
-      Object.entries(shape).map(([key, val]) => [key, { type: val.type, description: val.description, ...(val.enum ? { enum: val.enum } : {}) }]),
-    ),
-    required,
-  };
-}
-
-function buildToolDefinitions(
+/** Generic, non-banking tools (customer profile, tickets, conversation control, callbacks) —
+ *  the banking domain's tools live in ./definitions/*, one file per domain. */
+function buildCoreToolDefinitions(
   customers: CustomersService,
   tickets: TicketsService,
   conversations: ConversationsService,
@@ -229,90 +227,57 @@ function buildToolDefinitions(
         };
       },
     },
-    // --- Business domain: a single payment/transactions account system (§9 "Account tools").
-    //     Real per-customer data, sourced from Customer.metadata (seeded for the demo
-    //     customers — see prisma/seed.ts) so different logins actually see different
-    //     accounts/balances/transactions, with a generic fallback for ad-hoc customers
-    //     created via plain chat identify (no seeded metadata). Replace with a real
-    //     account/ledger service integration when one exists — the tool contract
-    //     (name/args/shape) wouldn't need to change.
-    {
-      name: 'get_account',
-      description: "Get the customer's payment account details (account number, type, status).",
-      inputSchema: z.object({}),
-      parametersJsonSchema: toJsonSchema({}, []),
-      idempotent: true,
-      handler: async (ctx) => {
-        const data = await loadCustomerAccountData(customers, ctx.customerId);
-        return data.account;
-      },
-    },
-    {
-      name: 'get_balance',
-      description: "Get the customer's current payment account balance.",
-      inputSchema: z.object({}),
-      parametersJsonSchema: toJsonSchema({}, []),
-      idempotent: true,
-      handler: async (ctx) => {
-        const data = await loadCustomerAccountData(customers, ctx.customerId);
-        return data.balance;
-      },
-    },
-    {
-      name: 'get_transactions',
-      description:
-        "Get the customer's recent payment transactions, including any that failed. Use this to answer " +
-        "questions like \"why did my payment fail\".",
-      inputSchema: z.object({ limit: z.number().int().min(1).max(20).optional() }),
-      parametersJsonSchema: toJsonSchema(
-        { limit: { type: 'number', description: 'Max number of recent transactions to return (default 5)' } },
-        [],
-      ),
-      idempotent: true,
-      handler: async (ctx, args) => {
-        const data = await loadCustomerAccountData(customers, ctx.customerId);
-        return { transactions: data.transactions.slice(0, args.limit ?? 5) };
-      },
-    },
   ];
 }
 
-interface AccountTransaction {
-  id: string;
-  date: string;
-  amount: number;
-  currency: string;
-  status: 'COMPLETED' | 'PENDING' | 'FAILED';
-  reason?: string;
-}
-
-interface CustomerAccountData {
-  account: { accountNumber: string; accountType: string; status: string; openedDate: string };
-  balance: { balance: number; currency: string };
-  transactions: AccountTransaction[];
-}
-
-const FALLBACK_ACCOUNT_DATA: CustomerAccountData = {
-  account: { accountNumber: 'ACC-00000000', accountType: 'PERSONAL', status: 'ACTIVE', openedDate: '2026-01-01' },
-  balance: { balance: 0, currency: 'SAR' },
-  transactions: [],
-};
-
-/** Reads the seeded demo account data off Customer.metadata, or a safe generic fallback for ad-hoc customers. */
-async function loadCustomerAccountData(customers: CustomersService, customerId?: string): Promise<CustomerAccountData> {
-  if (!customerId) return FALLBACK_ACCOUNT_DATA;
-  const customer = await customers.findOne(customerId);
-  const metadata = customer.metadata as { account?: unknown; balance?: unknown; transactions?: unknown } | null;
-  if (!metadata?.account || !metadata.balance) return FALLBACK_ACCOUNT_DATA;
-  return {
-    account: metadata.account as CustomerAccountData['account'],
-    balance: metadata.balance as CustomerAccountData['balance'],
-    transactions: Array.isArray(metadata.transactions) ? (metadata.transactions as AccountTransaction[]) : [],
-  };
+function buildToolDefinitions(
+  customers: CustomersService,
+  tickets: TicketsService,
+  conversations: ConversationsService,
+  callbacks: CallbacksService,
+  accounts: AccountsService,
+  transactions: TransactionsService,
+  cards: CardsService,
+  beneficiaries: BeneficiariesService,
+  transfers: TransfersService,
+  statements: StatementsService,
+  verification: VerificationService,
+  notifications: NotificationsService,
+  config: ConfigService,
+  prisma: PrismaService,
+): ToolDefinition[] {
+  return [
+    ...buildCoreToolDefinitions(customers, tickets, conversations, callbacks),
+    ...buildAccountTools(accounts, config),
+    ...buildTransactionTools(accounts, transactions),
+    ...buildCardTools(accounts, cards),
+    ...buildPinTools(cards, verification, notifications, prisma),
+    ...buildPasswordTools(verification, notifications, prisma),
+    ...buildBeneficiaryTools(beneficiaries),
+    ...buildTransferTools(accounts, transfers, verification, beneficiaries),
+    ...buildVerificationTools(verification, prisma),
+    ...buildSupportCaseTools(tickets, transactions),
+    ...buildStatementTools(accounts, statements),
+  ];
 }
 
 export const toolDefinitionsProvider: FactoryProvider<ToolDefinition[]> = {
   provide: TOOL_DEFINITIONS,
-  inject: [CustomersService, TicketsService, ConversationsService, CallbacksService],
+  inject: [
+    CustomersService,
+    TicketsService,
+    ConversationsService,
+    CallbacksService,
+    AccountsService,
+    TransactionsService,
+    CardsService,
+    BeneficiariesService,
+    TransfersService,
+    StatementsService,
+    VerificationService,
+    NotificationsService,
+    ConfigService,
+    PrismaService,
+  ],
   useFactory: buildToolDefinitions,
 };

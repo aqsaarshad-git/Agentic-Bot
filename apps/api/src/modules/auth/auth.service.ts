@@ -2,33 +2,19 @@ import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
-import { randomInt } from 'crypto';
 import { PrismaService } from '../../database/prisma.service';
-import { NotificationsService } from '../notifications/notifications.service';
+import { VerificationService } from '../verification/verification.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterUserDto } from './dto/register-user.dto';
 import { IdentifyCustomerDto } from './dto/identify-customer.dto';
 import { VerifyCustomerOtpDto } from './dto/verify-customer-otp.dto';
 
-interface PendingOtp {
-  code: string;
-  expiresAt: number;
-}
-
-const OTP_TTL_MS = 5 * 60 * 1000;
-
 @Injectable()
 export class AuthService {
-  /**
-   * In-memory OTP store — fine for a single-instance dev/demo deployment. A multi-instance
-   * production deployment would move this to Redis/the database with the same interface.
-   */
-  private readonly pendingOtps = new Map<string, PendingOtp>();
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
-    private readonly notifications: NotificationsService,
+    private readonly verification: VerificationService,
     private readonly config: ConfigService,
   ) {}
 
@@ -108,16 +94,7 @@ export class AuthService {
       });
     }
 
-    const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
-    this.pendingOtps.set(customer.id, { code, expiresAt: Date.now() + OTP_TTL_MS });
-
-    await this.notifications.send({
-      recipientType: 'CUSTOMER',
-      recipientId: customer.id,
-      channel: customer.email ? 'EMAIL' : 'SMS',
-      subject: 'Your verification code',
-      content: `Your verification code is ${code}. It expires in 5 minutes.`,
-    });
+    const { code } = await this.verification.createSession({ customerId: customer.id, purpose: 'IDENTITY' });
 
     const devBypassCode = this.config.get<string>('auth.otpDevBypassCode');
 
@@ -132,16 +109,7 @@ export class AuthService {
   }
 
   async verifyCustomerOtp(dto: VerifyCustomerOtpDto) {
-    const devBypassCode = this.config.get<string>('auth.otpDevBypassCode');
-    const isDevBypass = Boolean(devBypassCode) && dto.code === devBypassCode;
-
-    if (!isDevBypass) {
-      const pending = this.pendingOtps.get(dto.customerId);
-      if (!pending || pending.expiresAt < Date.now() || pending.code !== dto.code) {
-        throw new UnauthorizedException('Invalid or expired verification code');
-      }
-    }
-    this.pendingOtps.delete(dto.customerId);
+    await this.verification.verifyOtp({ customerId: dto.customerId, purpose: 'IDENTITY', code: dto.code });
 
     const customer = await this.prisma.customer.findUnique({ where: { id: dto.customerId } });
     if (!customer) {

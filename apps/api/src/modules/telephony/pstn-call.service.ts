@@ -4,8 +4,17 @@ import { randomUUID } from 'crypto';
 import { CallDirection } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { CallsService } from '../calls/calls.service';
+import { ConversationsService } from '../conversations/conversations.service';
 import { ChatGateway } from '../orchestrator/chat.gateway';
 import { TTS_PROVIDER, TtsProvider } from '../../ai/tts/tts-provider.interface';
+
+/** Spoken first, by the agent, before the caller says anything — see getGreetingAudio's own
+ *  doc comment for why every real PSTN call now gets one of these instead of only a
+ *  campaign-seeded script. Keyed by the Call's own already-resolved `language`, not re-derived. */
+const DEFAULT_GREETING: Record<'ar' | 'en', string> = {
+  en: 'Hello! How can I help you today?',
+  ar: 'مرحبًا! كيف يمكنني مساعدتك اليوم؟',
+};
 
 const WORKER_REQUEST_TIMEOUT_MS = 15_000;
 const STREAM_WAIT_TIMEOUT_MS = 45_000;
@@ -54,6 +63,7 @@ export class PstnCallService {
     private readonly config: ConfigService,
     private readonly prisma: PrismaService,
     private readonly callsService: CallsService,
+    private readonly conversations: ConversationsService,
     private readonly chatGateway: ChatGateway,
     @Inject(TTS_PROVIDER) private readonly tts: TtsProvider,
   ) {}
@@ -110,23 +120,33 @@ export class PstnCallService {
     return { callId: call.id, conversationId: call.conversationId };
   }
 
-  /** Called by the worker right after answer (both directions) to get a spoken opening line, if
-   *  any. Only present when the conversation was already seeded before the call connected — the
-   *  campaign scheduler does this via ConversationsService.addMessage (see
-   *  campaign-scheduler.service.ts) right after dial() returns; a plain inbound support call has
-   *  no such seed, and the caller simply speaks first, same as the browser flow today. */
+  /** Called by the worker right after answer (both directions) to get a spoken opening line —
+   *  every real PSTN call gets one, so the agent always speaks first and the caller answers into
+   *  a greeting rather than dead air. If the conversation was already seeded before the call
+   *  connected (the campaign scheduler does this via ConversationsService.addMessage — see
+   *  campaign-scheduler.service.ts — right after dial() returns), that seeded script IS the
+   *  greeting. Otherwise (a plain inbound support call, or a customer/admin-initiated dial-me/
+   *  dial-out with no script) this seeds a standard greeting itself, in the call's own resolved
+   *  language, so the transcript still starts with a real, persisted AI message either way. */
   async getGreetingAudio(callId: string): Promise<{ audioBase64: string | null; format?: string }> {
-    const call = await this.prisma.call.findUnique({ where: { id: callId }, select: { conversationId: true } });
+    const call = await this.prisma.call.findUnique({ where: { id: callId }, select: { conversationId: true, language: true } });
     if (!call?.conversationId) return { audioBase64: null };
 
-    const seeded = await this.prisma.message.findFirst({
-      where: { conversationId: call.conversationId, sender: 'AI' },
-      orderBy: { createdAt: 'asc' },
-    });
-    if (!seeded?.content) return { audioBase64: null };
+    let greetingText = (
+      await this.prisma.message.findFirst({
+        where: { conversationId: call.conversationId, sender: 'AI' },
+        orderBy: { createdAt: 'asc' },
+      })
+    )?.content;
+
+    if (!greetingText) {
+      greetingText = DEFAULT_GREETING[call.language === 'en' ? 'en' : 'ar'];
+      await this.conversations.addMessage(call.conversationId, 'AI', greetingText);
+      this.chatGateway.broadcast(call.conversationId, 'message', { sender: 'AI', content: greetingText });
+    }
 
     try {
-      const synthesized = await this.tts.synthesize(seeded.content);
+      const synthesized = await this.tts.synthesize(greetingText);
       const audio = synthesized.format === 'wav' ? applyGainToWav(synthesized.audio, PSTN_GAIN_BOOST) : synthesized.audio;
       return { audioBase64: audio.toString('base64'), format: synthesized.format };
     } catch (error) {

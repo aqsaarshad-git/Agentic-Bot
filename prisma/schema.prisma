@@ -62,8 +62,8 @@ model User {
   createdAt    DateTime   @default(now()) @map("created_at")
   updatedAt    DateTime   @updatedAt @map("updated_at")
 
-  role               Role               @relation(fields: [roleId], references: [id])
-  ticketAssignments  TicketAssignment[]
+  role              Role               @relation(fields: [roleId], references: [id])
+  ticketAssignments TicketAssignment[]
 
   @@index([roleId])
   @@map("users")
@@ -84,11 +84,24 @@ model Customer {
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
-  conversations     Conversation[]
-  calls             Call[]
-  tickets           Ticket[]
-  callbacks         Callback[]
-  campaignContacts  CampaignContact[]
+  // Online-banking login state (category F — no separate login UI exists in this repo;
+  // this models the underlying account so "forgot password"/"account locked" workflows
+  // have real state to check and mutate).
+  passwordHash          String?   @map("password_hash")
+  onlineBankingLocked   Boolean   @default(false) @map("online_banking_locked")
+  onlineBankingLockedAt DateTime? @map("online_banking_locked_at")
+  failedLoginAttempts   Int       @default(0) @map("failed_login_attempts")
+
+  conversations        Conversation[]
+  calls                Call[]
+  tickets              Ticket[]
+  callbacks            Callback[]
+  campaignContacts     CampaignContact[]
+  accounts             Account[]
+  beneficiaries        Beneficiary[]
+  transfers            Transfer[]
+  verificationSessions VerificationSession[]
+  statementRequests    StatementRequest[]
 
   @@index([email])
   @@index([phone])
@@ -121,21 +134,21 @@ model AiAgent {
 }
 
 model AgentConfig {
-  id                   String   @id @default(cuid())
-  agentId              String   @map("agent_id")
-  version              Int      @default(1)
-  systemInstructions   String   @map("system_instructions") @db.Text
-  supportedLanguages   Json     @map("supported_languages")
-  voiceConfig          Json?    @map("voice_config")
-  personality          Json?
-  allowedTools         Json     @map("allowed_tools")
-  knowledgeBaseAccess  Boolean  @default(true) @map("knowledge_base_access")
-  escalationRules      Json?    @map("escalation_rules")
-  businessRules        Json?    @map("business_rules")
-  workingHours         Json?    @map("working_hours")
-  isActive             Boolean  @default(true) @map("is_active")
-  createdAt            DateTime @default(now()) @map("created_at")
-  updatedAt            DateTime @updatedAt @map("updated_at")
+  id                  String   @id @default(cuid())
+  agentId             String   @map("agent_id")
+  version             Int      @default(1)
+  systemInstructions  String   @map("system_instructions") @db.Text
+  supportedLanguages  Json     @map("supported_languages")
+  voiceConfig         Json?    @map("voice_config")
+  personality         Json?
+  allowedTools        Json     @map("allowed_tools")
+  knowledgeBaseAccess Boolean  @default(true) @map("knowledge_base_access")
+  escalationRules     Json?    @map("escalation_rules")
+  businessRules       Json?    @map("business_rules")
+  workingHours        Json?    @map("working_hours")
+  isActive            Boolean  @default(true) @map("is_active")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
 
   agent AiAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
@@ -164,33 +177,33 @@ enum CallTransport {
 }
 
 model Call {
-  id                String                @id @default(cuid())
-  customerId        String                @map("customer_id")
-  aiAgentId         String?               @map("ai_agent_id")
-  conversationId    String?               @unique @map("conversation_id")
-  direction         CallDirection
-  liveKitRoomName   String?               @map("livekit_room_name")
-  transport         CallTransport         @default(WEBRTC)
-  fromNumber        String?               @map("from_number")
-  toNumber          String?               @map("to_number")
-  providerCallUuid  String?               @unique @map("provider_call_uuid")
-  startTime         DateTime              @default(now()) @map("start_time")
-  endTime           DateTime?             @map("end_time")
-  durationSeconds   Int?                  @map("duration_seconds")
-  language          String?
-  intent            String?
-  outcome           String?
-  escalationStatus  CallEscalationStatus  @default(NONE) @map("escalation_status")
-  createdAt         DateTime              @default(now()) @map("created_at")
-  updatedAt         DateTime              @updatedAt @map("updated_at")
+  id               String               @id @default(cuid())
+  customerId       String               @map("customer_id")
+  aiAgentId        String?              @map("ai_agent_id")
+  conversationId   String?              @unique @map("conversation_id")
+  direction        CallDirection
+  liveKitRoomName  String?              @map("livekit_room_name")
+  transport        CallTransport        @default(WEBRTC)
+  fromNumber       String?              @map("from_number")
+  toNumber         String?              @map("to_number")
+  providerCallUuid String?              @unique @map("provider_call_uuid")
+  startTime        DateTime             @default(now()) @map("start_time")
+  endTime          DateTime?            @map("end_time")
+  durationSeconds  Int?                 @map("duration_seconds")
+  language         String?
+  intent           String?
+  outcome          String?
+  escalationStatus CallEscalationStatus @default(NONE) @map("escalation_status")
+  createdAt        DateTime             @default(now()) @map("created_at")
+  updatedAt        DateTime             @updatedAt @map("updated_at")
 
-  customer      Customer         @relation(fields: [customerId], references: [id])
-  aiAgent       AiAgent?         @relation(fields: [aiAgentId], references: [id])
-  conversation  Conversation?    @relation(fields: [conversationId], references: [id])
-  recording     CallRecording?
-  transcript    CallTranscript?
-  toolExecutions ToolExecution[]
-  campaignCalls CampaignCall[]
+  customer        Customer        @relation(fields: [customerId], references: [id])
+  aiAgent         AiAgent?        @relation(fields: [aiAgentId], references: [id])
+  conversation    Conversation?   @relation(fields: [conversationId], references: [id])
+  recording       CallRecording?
+  transcript      CallTranscript?
+  toolExecutions  ToolExecution[]
+  campaignCalls   CampaignCall[]
   callbackRequest Callback?
 
   @@index([customerId])
@@ -248,25 +261,28 @@ enum ConversationState {
 }
 
 model Conversation {
-  id               String              @id @default(cuid())
-  customerId       String              @map("customer_id")
-  aiAgentId        String?             @map("ai_agent_id")
-  channel          ConversationChannel @default(TEXT)
-  state            ConversationState   @default(CALL_STARTED)
-  intent           String?
-  startedAt        DateTime            @default(now()) @map("started_at")
-  endedAt          DateTime?           @map("ended_at")
-  createdAt        DateTime            @default(now()) @map("created_at")
-  updatedAt        DateTime            @updatedAt @map("updated_at")
+  id         String              @id @default(cuid())
+  customerId String              @map("customer_id")
+  aiAgentId  String?             @map("ai_agent_id")
+  channel    ConversationChannel @default(TEXT)
+  state      ConversationState   @default(CALL_STARTED)
+  intent     String?
+  startedAt  DateTime            @default(now()) @map("started_at")
+  endedAt    DateTime?           @map("ended_at")
+  createdAt  DateTime            @default(now()) @map("created_at")
+  updatedAt  DateTime            @updatedAt @map("updated_at")
 
-  customer   Customer               @relation(fields: [customerId], references: [id])
-  aiAgent    AiAgent?               @relation(fields: [aiAgentId], references: [id])
-  messages   Message[]
-  summaries  ConversationSummary[]
-  tickets    Ticket[]
-  toolExecutions ToolExecution[]
-  callbacks  Callback[]
-  call       Call?
+  customer             Customer              @relation(fields: [customerId], references: [id])
+  aiAgent              AiAgent?              @relation(fields: [aiAgentId], references: [id])
+  messages             Message[]
+  summaries            ConversationSummary[]
+  tickets              Ticket[]
+  toolExecutions       ToolExecution[]
+  callbacks            Callback[]
+  call                 Call?
+  transfers            Transfer[]
+  verificationSessions VerificationSession[]
+  statementRequests    StatementRequest[]
 
   @@index([customerId])
   @@index([aiAgentId])
@@ -343,13 +359,29 @@ model Ticket {
   createdAt      DateTime       @default(now()) @map("created_at")
   updatedAt      DateTime       @updatedAt @map("updated_at")
 
-  customer     Customer            @relation(fields: [customerId], references: [id])
-  conversation Conversation?       @relation(fields: [conversationId], references: [id])
+  // Support-case / dispute fields (categories K + M reuse Ticket rather than a parallel
+  // model). `category` stays free-text for backward compatibility; recommended banking
+  // vocabulary: ACCOUNT_ISSUE | CARD_ISSUE | FRAUD_DISPUTE | TRANSACTION_DISPUTE |
+  // COMPLAINT | GENERAL_INQUIRY, with `subcategory` for specifics (e.g. LOST_CARD).
+  subcategory   String?  @map("subcategory")
+  accountId     String?  @map("account_id")
+  cardId        String?  @map("card_id")
+  transactionId String?  @map("transaction_id")
+  disputeAmount Decimal? @map("dispute_amount") @db.Decimal(18, 2)
+
+  customer     Customer           @relation(fields: [customerId], references: [id])
+  conversation Conversation?      @relation(fields: [conversationId], references: [id])
   messages     TicketMessage[]
   assignments  TicketAssignment[]
+  account      Account?           @relation(fields: [accountId], references: [id])
+  card         Card?              @relation(fields: [cardId], references: [id])
+  transaction  Transaction?       @relation(fields: [transactionId], references: [id])
 
   @@index([customerId])
   @@index([status])
+  @@index([accountId])
+  @@index([cardId])
+  @@index([transactionId])
   @@map("tickets")
 }
 
@@ -433,14 +465,14 @@ model KnowledgeChunk {
 // ---------------------------------------------------------------------------
 
 model Tool {
-  id                  String   @id @default(cuid())
-  name                String   @unique
-  description         String   @db.Text
-  inputSchema         Json     @map("input_schema")
-  requiredPermission  String?  @map("required_permission")
-  isEnabled           Boolean  @default(true) @map("is_enabled")
-  createdAt           DateTime @default(now()) @map("created_at")
-  updatedAt           DateTime @updatedAt @map("updated_at")
+  id                 String   @id @default(cuid())
+  name               String   @unique
+  description        String   @db.Text
+  inputSchema        Json     @map("input_schema")
+  requiredPermission String?  @map("required_permission")
+  isEnabled          Boolean  @default(true) @map("is_enabled")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
 
   executions ToolExecution[]
 
@@ -515,13 +547,13 @@ enum CampaignContactStatus {
 }
 
 model CampaignContact {
-  id         String                 @id @default(cuid())
-  campaignId String                 @map("campaign_id")
-  customerId String                 @map("customer_id")
-  status        CampaignContactStatus  @default(PENDING)
-  attempts      Int                    @default(0)
-  lastAttemptAt DateTime?              @map("last_attempt_at")
-  createdAt     DateTime               @default(now()) @map("created_at")
+  id            String                @id @default(cuid())
+  campaignId    String                @map("campaign_id")
+  customerId    String                @map("customer_id")
+  status        CampaignContactStatus @default(PENDING)
+  attempts      Int                   @default(0)
+  lastAttemptAt DateTime?             @map("last_attempt_at")
+  createdAt     DateTime              @default(now()) @map("created_at")
 
   campaign Campaign       @relation(fields: [campaignId], references: [id], onDelete: Cascade)
   customer Customer       @relation(fields: [customerId], references: [id])
@@ -543,12 +575,12 @@ enum CampaignCallOutcome {
 }
 
 model CampaignCall {
-  id                 String              @id @default(cuid())
-  campaignContactId  String              @map("campaign_contact_id")
-  callId             String?             @map("call_id")
-  attemptNumber      Int                 @map("attempt_number")
-  outcome            CampaignCallOutcome
-  createdAt          DateTime            @default(now()) @map("created_at")
+  id                String              @id @default(cuid())
+  campaignContactId String              @map("campaign_contact_id")
+  callId            String?             @map("call_id")
+  attemptNumber     Int                 @map("attempt_number")
+  outcome           CampaignCallOutcome
+  createdAt         DateTime            @default(now()) @map("created_at")
 
   campaignContact CampaignContact @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
   call            Call?           @relation(fields: [callId], references: [id])
@@ -656,4 +688,345 @@ model AuditLog {
   @@index([actorType, actorId])
   @@index([requestId])
   @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Banking domain — accounts, transactions, cards, beneficiaries, transfers
+// ---------------------------------------------------------------------------
+
+enum AccountType {
+  CHECKING
+  SAVINGS
+  BUSINESS
+}
+
+enum AccountStatus {
+  ACTIVE
+  DORMANT
+  SUSPENDED
+  CLOSED
+}
+
+model Account {
+  id                   String        @id @default(cuid())
+  accountNumber        String        @unique @map("account_number")
+  customerId           String        @map("customer_id")
+  accountType          AccountType   @default(CHECKING) @map("account_type")
+  status               AccountStatus @default(ACTIVE)
+  currency             String        @default("SAR")
+  balance              Decimal       @default(0) @db.Decimal(18, 2)
+  availableBalance     Decimal       @default(0) @map("available_balance") @db.Decimal(18, 2)
+  dailyTransferLimit   Decimal       @default(50000) @map("daily_transfer_limit") @db.Decimal(18, 2)
+  dailyWithdrawalLimit Decimal       @default(10000) @map("daily_withdrawal_limit") @db.Decimal(18, 2)
+  statusReason         String?       @map("status_reason")
+  openedAt             DateTime      @default(now()) @map("opened_at")
+  closedAt             DateTime?     @map("closed_at")
+  createdAt            DateTime      @default(now()) @map("created_at")
+  updatedAt            DateTime      @updatedAt @map("updated_at")
+
+  customer          Customer           @relation(fields: [customerId], references: [id])
+  transactions      Transaction[]
+  cards             Card[]
+  transfersFrom     Transfer[]         @relation("TransferFromAccount")
+  transfersTo       Transfer[]         @relation("TransferToAccount")
+  statementRequests StatementRequest[]
+  tickets           Ticket[]
+
+  @@index([customerId])
+  @@index([status])
+  @@map("accounts")
+}
+
+enum TransactionType {
+  DEBIT
+  CREDIT
+}
+
+enum TransactionChannel {
+  CARD_PURCHASE
+  POS
+  ONLINE
+  ATM_WITHDRAWAL
+  ATM_DEPOSIT
+  TRANSFER
+  FEE
+  REFUND
+  DIRECT_DEBIT
+  OTHER
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum TransactionFailureReason {
+  INSUFFICIENT_FUNDS
+  CARD_EXPIRED
+  CARD_BLOCKED
+  ACCOUNT_SUSPENDED
+  LIMIT_EXCEEDED
+  INCORRECT_PIN
+  ISSUER_DECLINED
+  NETWORK_ERROR
+  FRAUD_SUSPECTED
+  OTHER
+}
+
+model Transaction {
+  id             String                    @id @default(cuid())
+  transactionRef String                    @unique @map("transaction_ref")
+  accountId      String                    @map("account_id")
+  cardId         String?                   @map("card_id")
+  type           TransactionType
+  channel        TransactionChannel        @default(OTHER)
+  amount         Decimal                   @db.Decimal(18, 2)
+  currency       String                    @default("SAR")
+  status         TransactionStatus         @default(PENDING)
+  failureReason  TransactionFailureReason? @map("failure_reason")
+  description    String?
+  merchantName   String?                   @map("merchant_name")
+  postedAt       DateTime                  @default(now()) @map("posted_at")
+  settledAt      DateTime?                 @map("settled_at")
+  createdAt      DateTime                  @default(now()) @map("created_at")
+  updatedAt      DateTime                  @updatedAt @map("updated_at")
+
+  account        Account   @relation(fields: [accountId], references: [id])
+  card           Card?     @relation(fields: [cardId], references: [id])
+  transferResult Transfer?
+  disputeTickets Ticket[]
+
+  @@index([accountId])
+  @@index([accountId, postedAt])
+  @@index([status])
+  @@index([cardId])
+  @@map("transactions")
+}
+
+enum CardType {
+  DEBIT
+  CREDIT
+  PREPAID
+}
+
+enum CardStatus {
+  ACTIVE
+  BLOCKED
+  EXPIRED
+  LOST
+  STOLEN
+  PENDING_ACTIVATION
+  PENDING_REPLACEMENT
+}
+
+model Card {
+  id                 String     @id @default(cuid())
+  cardNumberMasked   String     @map("card_number_masked")
+  accountId          String     @map("account_id")
+  cardType           CardType   @default(DEBIT) @map("card_type")
+  status             CardStatus @default(PENDING_ACTIVATION)
+  expiryMonth        Int        @map("expiry_month")
+  expiryYear         Int        @map("expiry_year")
+  dailyPurchaseLimit Decimal    @default(5000) @map("daily_purchase_limit") @db.Decimal(18, 2)
+  dailyAtmLimit      Decimal    @default(3000) @map("daily_atm_limit") @db.Decimal(18, 2)
+  // PIN is never stored/returned in plaintext — only a bcrypt hash, set exclusively by
+  // the complete_pin_reset workflow (never read back).
+  pinHash            String?    @map("pin_hash") @db.VarChar(255)
+  pinSetAt           DateTime?  @map("pin_set_at")
+  pinFailedAttempts  Int        @default(0) @map("pin_failed_attempts")
+  pinBlockedAt       DateTime?  @map("pin_blocked_at")
+  activatedAt        DateTime?  @map("activated_at")
+  blockedAt          DateTime?  @map("blocked_at")
+  blockReason        String?    @map("block_reason")
+  lostReportedAt     DateTime?  @map("lost_reported_at")
+  stolenReportedAt   DateTime?  @map("stolen_reported_at")
+  replacesCardId     String?    @unique @map("replaces_card_id")
+  createdAt          DateTime   @default(now()) @map("created_at")
+  updatedAt          DateTime   @updatedAt @map("updated_at")
+
+  account        Account       @relation(fields: [accountId], references: [id])
+  transactions   Transaction[]
+  replacesCard   Card?         @relation("CardReplacement", fields: [replacesCardId], references: [id])
+  replacedBy     Card?         @relation("CardReplacement")
+  disputeTickets Ticket[]
+
+  @@index([accountId])
+  @@index([status])
+  @@map("cards")
+}
+
+enum BeneficiaryStatus {
+  ACTIVE
+  PENDING_VERIFICATION
+  BLOCKED
+  REMOVED
+}
+
+model Beneficiary {
+  id              String            @id @default(cuid())
+  customerId      String            @map("customer_id")
+  nickname        String?
+  beneficiaryName String            @map("beneficiary_name")
+  accountNumber   String            @map("account_number")
+  bankName        String?           @map("bank_name")
+  bankCode        String?           @map("bank_code")
+  status          BeneficiaryStatus @default(ACTIVE)
+  addedAt         DateTime          @default(now()) @map("added_at")
+  removedAt       DateTime?         @map("removed_at")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  customer  Customer   @relation(fields: [customerId], references: [id])
+  transfers Transfer[]
+
+  @@unique([customerId, accountNumber])
+  @@index([customerId, status])
+  @@map("beneficiaries")
+}
+
+enum TransferType {
+  INTERNAL
+  BENEFICIARY
+}
+
+enum TransferStatus {
+  PENDING_CONFIRMATION
+  CONFIRMED
+  COMPLETED
+  FAILED
+  CANCELLED
+  EXPIRED
+  SUPERSEDED
+}
+
+model Transfer {
+  id                     String                    @id @default(cuid())
+  transferReference      String                    @unique @map("transfer_reference")
+  customerId             String                    @map("customer_id")
+  conversationId         String                    @map("conversation_id")
+  verificationSessionId  String?                   @map("verification_session_id")
+  fromAccountId          String                    @map("from_account_id")
+  toAccountId            String?                   @map("to_account_id")
+  beneficiaryId          String?                   @map("beneficiary_id")
+  type                   TransferType
+  amount                 Decimal                   @db.Decimal(18, 2)
+  currency               String                    @default("SAR")
+  reason                 String?
+  status                 TransferStatus            @default(PENDING_CONFIRMATION)
+  failureReason          TransactionFailureReason? @map("failure_reason")
+  resultingTransactionId String?                   @unique @map("resulting_transaction_id")
+  confirmationExpiresAt  DateTime                  @map("confirmation_expires_at")
+  confirmedAt            DateTime?                 @map("confirmed_at")
+  executedAt             DateTime?                 @map("executed_at")
+  providerReference      String?                   @map("provider_reference")
+  createdAt              DateTime                  @default(now()) @map("created_at")
+  updatedAt              DateTime                  @updatedAt @map("updated_at")
+
+  customer             Customer             @relation(fields: [customerId], references: [id])
+  conversation         Conversation         @relation(fields: [conversationId], references: [id])
+  verificationSession  VerificationSession? @relation(fields: [verificationSessionId], references: [id])
+  fromAccount          Account              @relation("TransferFromAccount", fields: [fromAccountId], references: [id])
+  toAccount            Account?             @relation("TransferToAccount", fields: [toAccountId], references: [id])
+  beneficiary          Beneficiary?         @relation(fields: [beneficiaryId], references: [id])
+  resultingTransaction Transaction?         @relation(fields: [resultingTransactionId], references: [id])
+
+  @@index([customerId])
+  @@index([fromAccountId])
+  @@index([conversationId, status])
+  @@map("transfers")
+}
+
+enum StatementRequestStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+model StatementRequest {
+  id             String                 @id @default(cuid())
+  requestNumber  String                 @unique @map("request_number")
+  customerId     String                 @map("customer_id")
+  accountId      String                 @map("account_id")
+  // Nullable — a staff/API-issued statement request may have no conversation at all. When
+  // present, it's what getActivePendingEmailRequest uses to scope "the statement THIS
+  // conversation just generated" — same per-conversation pending-state pattern as
+  // Transfer.conversationId + TransfersService.getActivePendingSummary.
+  conversationId String?                @map("conversation_id")
+  periodStart    DateTime               @map("period_start")
+  periodEnd      DateTime               @map("period_end")
+  format         String                 @default("PDF")
+  status         StatementRequestStatus @default(PENDING)
+  downloadUrl    String?                @map("download_url")
+  requestedAt    DateTime               @default(now()) @map("requested_at")
+  readyAt        DateTime?              @map("ready_at")
+  // Set only after a REAL successful email send (see StatementsService.sendStatementByEmail) —
+  // doubles as both the audit timestamp and the idempotency guard: a second send attempt for
+  // the same request checks this first rather than blindly re-sending.
+  emailSentAt    DateTime?              @map("email_sent_at")
+
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  account      Account       @relation(fields: [accountId], references: [id])
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+
+  @@index([customerId])
+  @@index([accountId])
+  @@index([conversationId])
+  @@map("statement_requests")
+}
+
+// ---------------------------------------------------------------------------
+// Identity verification (OTP-based) — backs both the bootstrap customer-login
+// flow (conversationId null) and in-conversation step-up for PIN/password
+// reset and money movement (conversationId set, purpose set).
+//
+// Conceptual states per spec: UNVERIFIED / IDENTIFIED / VERIFICATION_REQUIRED
+// are derived (no session row, or an expired one) rather than stored; only
+// VERIFICATION_IN_PROGRESS / VERIFIED / VERIFICATION_FAILED / LOCKED are ever
+// persisted as a row's actual status.
+// ---------------------------------------------------------------------------
+
+enum VerificationMethod {
+  OTP_SMS
+  OTP_EMAIL
+}
+
+enum VerificationPurpose {
+  IDENTITY
+  PIN_RESET
+  PASSWORD_RESET
+}
+
+enum VerificationStatus {
+  VERIFICATION_IN_PROGRESS
+  VERIFIED
+  VERIFICATION_FAILED
+  LOCKED
+}
+
+model VerificationSession {
+  id             String              @id @default(cuid())
+  customerId     String              @map("customer_id")
+  conversationId String?             @map("conversation_id")
+  purpose        VerificationPurpose @default(IDENTITY)
+  targetRef      String?             @map("target_ref")
+  method         VerificationMethod  @default(OTP_SMS)
+  codeHash       String?             @map("code_hash") @db.VarChar(255)
+  status         VerificationStatus  @default(VERIFICATION_IN_PROGRESS)
+  attempts       Int                 @default(0)
+  maxAttempts    Int                 @default(3) @map("max_attempts")
+  expiresAt      DateTime            @map("expires_at")
+  verifiedAt     DateTime?           @map("verified_at")
+  consumedAt     DateTime?           @map("consumed_at")
+  lockedAt       DateTime?           @map("locked_at")
+  createdAt      DateTime            @default(now()) @map("created_at")
+
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+  transfers    Transfer[]
+
+  @@index([customerId, createdAt])
+  @@index([conversationId, createdAt])
+  @@map("verification_sessions")
 }
