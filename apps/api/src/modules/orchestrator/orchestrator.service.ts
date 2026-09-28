@@ -14,7 +14,7 @@ import { AuditService } from '../audit/audit.service';
 import { AgentsService } from '../agents/agents.service';
 import { ConversationsService } from '../conversations/conversations.service';
 import { ToolRegistryService } from '../tools/tool-registry.service';
-import { InsufficientVerificationException } from '../tools/verification-level';
+import { InsufficientVerificationException, VerificationLevel } from '../tools/verification-level';
 import { KnowledgeService } from '../knowledge/knowledge.service';
 import { VerificationService } from '../verification/verification.service';
 import { TransfersService } from '../transfers/transfers.service';
@@ -762,19 +762,41 @@ export function detectTransferReplyIntent(content: string, isArabic: boolean): '
 // SEPARATE small pattern set for the "send/email it" phrasing a customer naturally uses to
 // confirm DELIVERY specifically — same anchoring discipline (full-string match, short-message
 // cap only), just a different, still narrow, vocabulary.
-const SEND_CONFIRM_PATTERNS_EN = [
-  /^yes[,.!\s]*(please)?[,.!\s]*(send|email)\s?it[.!]*$/i,
-  /^(please\s+)?(send|email)\s?it[.!]*$/i,
-  /^go\s?ahead\s+and\s+(send|email)\s?it[.!]*$/i,
-];
-const SEND_CONFIRM_PATTERNS_AR = [/^نعم[.!؟\s]*أرسل(ه)?[.!؟\s]*$/, /^أرسل(ه)?[.!؟\s]*$/];
+// BROADENED (2026-09-28, confirmed live): the original full-string-anchored patterns below only
+// ever matched a terse "yes, send it"/"please email it" — a real customer answered the agent's
+// own "would you like me to email it?" with "Yes, send me through the email.", which matches
+// NEITHER the full-string patterns (extra words after "yes" break the `$` anchor) NOR
+// MAX_SHORT_REPLY_LENGTH (31 chars, one over the 30-char cap) — so this fell through entirely to
+// Qwen's own free-decision loop, which then called the WRONG tool (get_statement, with a
+// hallucinated request number) and reported a confusing failure for what should have been an
+// instant, correct send. Replaced full-string anchoring with a shape check instead: the message
+// must OPEN with an affirmative/imperative token (not just contain one anywhere, so an unrelated
+// message that merely mentions "email" later is never swept in) AND mention delivery somewhere,
+// AND contain no negation — this is deliberately more permissive than detectTransferReplyIntent
+// (money-moving, kept narrow on purpose) because the blast radius here is just emailing the
+// customer's own already-generated statement to their own registered address a turn early.
+const SEND_CONFIRM_LEADING_EN = /^(yes|yeah|yep|sure|ok(ay)?|please|go\s?ahead|do\s?it|send|email|mail)\b/i;
+const SEND_CONFIRM_MENTIONS_EN = /\b(send|email|mail)\b/i;
+const SEND_CONFIRM_NEGATIVE_EN = /\b(no|don'?t|stop|cancel|wait|not\s+now|instead)\b/i;
+// No \b here deliberately — JS \b is defined relative to \w, which Arabic letters aren't part of
+// (see the spoken-digit-OTP fix's own comment above for the same pitfall), so a literal prefix/
+// substring check is used instead of a word-boundaried one.
+const SEND_CONFIRM_LEADING_AR = /^(نعم|ايوه|أيوه|تمام|اوك|أوك|أكد|أرسل|ارسل)/;
+const SEND_CONFIRM_MENTIONS_AR = /(أرسل|ارسل|البريد|الإيميل|الايميل|إيميل|ايميل)/;
+const SEND_CONFIRM_NEGATIVE_AR = /(لا\s|إلغاء|كنسل|متأكد)/;
+const MAX_SEND_CONFIRM_LENGTH = 60;
 
 export function detectSendConfirmIntent(content: string, isArabic: boolean): boolean {
   const trimmed = content.trim();
-  if (trimmed.length === 0 || trimmed.length > MAX_SHORT_REPLY_LENGTH) return false;
-  const normalized = trimmed.toLowerCase();
-  const patterns = isArabic ? SEND_CONFIRM_PATTERNS_AR : SEND_CONFIRM_PATTERNS_EN;
-  return patterns.some((p) => p.test(normalized));
+  if (trimmed.length === 0 || trimmed.length > MAX_SEND_CONFIRM_LENGTH) return false;
+  if (isArabic) {
+    return (
+      SEND_CONFIRM_LEADING_AR.test(trimmed) && SEND_CONFIRM_MENTIONS_AR.test(trimmed) && !SEND_CONFIRM_NEGATIVE_AR.test(trimmed)
+    );
+  }
+  return (
+    SEND_CONFIRM_LEADING_EN.test(trimmed) && SEND_CONFIRM_MENTIONS_EN.test(trimmed) && !SEND_CONFIRM_NEGATIVE_EN.test(trimmed)
+  );
 }
 
 const MAX_OTP_MESSAGE_LENGTH = 60;
@@ -951,6 +973,96 @@ function formatCasesReply(result: unknown, isArabic: boolean): string {
     : `Your most recent case (${latest.caseId}, ${latest.category}) is currently ${latest.status.toLowerCase()}.`;
 }
 
+// CONFIRMED LIVE (2026-09-28, real PSTN call with Ahmed): "Can I get my bank statement of last
+// month?" got a fast, correct reply ("Would you like that [emailed]?") with no tool call yet
+// (still fine — a real clarifying question). But the customer's "Yes please" — answering that
+// exact question — had NOTHING deterministic to catch it (request_statement wasn't on the
+// ZERO_ARG_FORCED_TOOLS list, and the send-confirmation detector requires a statement to already
+// exist, which none did yet), so it fell entirely to Qwen's own free-decision loop: 13.5s of dead
+// air before any audio, then a reply that only said "ready to download" — the customer's actual
+// ask (get it emailed) was dropped for the rest of the call; send_statement_by_email never ran
+// at all. Fixed by forcing request_statement itself (it's genuinely zero-argument now — see the
+// default-period feature), same as card status / PIN reset initiation already are, so the
+// request step is instant and its own reply always explicitly offers the email step — which
+// then lands correctly on the existing send-confirmation forced detector once the customer says
+// yes, closing both the latency gap and the dropped-request gap together.
+function formatStatementRequestReply(result: unknown, isArabic: boolean): string {
+  const data = result as { periodStart: string; periodEnd: string };
+  const start = formatDateSpoken(data.periodStart, isArabic);
+  const end = formatDateSpoken(data.periodEnd, isArabic);
+  return isArabic
+    ? `كشف حسابك من ${start} إلى ${end} جاهز. هل ترغب أن أرسله إلى بريدك الإلكتروني المسجل؟`
+    : `Your statement from ${start} to ${end} is ready. Would you like me to email it to your registered address?`;
+}
+
+// CONFIRMED LIVE BUG (2026-09-28, real call: customer asked for "June", got August): moving
+// request_statement into ZERO_ARG_FORCED_TOOLS (above) fixed the earlier "dropped request"
+// latency gap, but that path always calls the tool with {} — no period — which silently
+// discarded a customer-named period instead of asking Qwen to parse it (request_statement's own
+// tool description already tells Qwen to convert a named month/range into period_start/period_end
+// itself; the forced path never gave it the chance). This detector identifies any message with an
+// explicit period at all; see parseNamedMonthPeriod just below for what happens next — a BARE
+// month name is now also parsed deterministically (a second confirmed live bug: Qwen's own
+// arithmetic for "the month of June" produced period_start=2026-05-31 instead of 2026-06-01), and
+// only a genuinely complex relative period (an explicit range, "last 3 months", ...) still goes to
+// Qwen's own NLU. Not exhaustive by design (matches the same keyword-heuristic style as every
+// other detector in this file): a period phrasing outside this list still falls back to the safe
+// default rather than guessing wrong, and defaulting instead of guessing is the intentional,
+// correct trade-off here.
+const STATEMENT_MONTH_NAMES_EN =
+  /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b/i;
+const STATEMENT_MONTH_NAMES_AR =
+  /(يناير|فبراير|مارس|أبريل|مايو|يونيو|يوليو|أغسطس|سبتمبر|أكتوبر|نوفمبر|ديسمبر|كانون الثاني|شباط|آذار|نيسان|أيار|حزيران|تموز|آب|أيلول|تشرين الأول|تشرين الثاني|كانون الأول)/;
+const STATEMENT_RELATIVE_PERIOD_EN =
+  /\b(last|past|previous)\s+\d+\s+months?\b|\bsince\b|\bbetween\b.*\band\b|\bfrom\b.*\bto\b|\b(this|last)\s+year\b|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}(\/\d{2,4})?/i;
+const STATEMENT_RELATIVE_PERIOD_AR = /آخر\s*\d+\s*أشهر|منذ|بين.*و|من.*إلى|هذا العام|العام الماضي|السنة الماضية/;
+
+function hasExplicitStatementPeriod(content: string, isArabic: boolean): boolean {
+  return isArabic
+    ? STATEMENT_MONTH_NAMES_AR.test(content) || STATEMENT_RELATIVE_PERIOD_AR.test(content)
+    : STATEMENT_MONTH_NAMES_EN.test(content) || STATEMENT_RELATIVE_PERIOD_EN.test(content);
+}
+
+// CONFIRMED LIVE BUG (2026-09-28, real call): asked for "the month of June", Qwen's own parsed
+// args were period_start=2026-05-31 / period_end=2026-06-30 — the END boundary was right but the
+// START was a full day off (May 31st, not June 1st). A month name has exactly one correct
+// interpretation once "today" is known (see the date-context fix above) — there's nothing for an
+// LLM to usefully judge here, only arithmetic it demonstrably got wrong live, so this computes it
+// directly instead of trusting Qwen's own date math (same reasoning as lastCalendarMonth() for
+// the no-period default). Deliberately narrow: only fires for a BARE month name with no other
+// period qualifier in the same message (checked via STATEMENT_RELATIVE_PERIOD_*, so "since June"
+// or "from June to August" still fall through to Qwen's real NLU, which this lookup can't cover).
+// A named month with no stated year always means its most recent COMPLETED occurrence — the same
+// "always a finished calendar month" convention lastCalendarMonth() already uses for the default:
+// "June" asked for in September 2026 means June 2026 (already completed); "October" asked for in
+// September 2026 means October 2025 (this year's October hasn't happened yet).
+const MONTH_INDEX_EN: Record<string, number> = {
+  january: 0, jan: 0, february: 1, feb: 1, march: 2, mar: 2, april: 3, apr: 3, may: 4,
+  june: 5, jun: 5, july: 6, jul: 6, august: 7, aug: 7, september: 8, sep: 8, sept: 8,
+  october: 9, oct: 9, november: 10, nov: 10, december: 11, dec: 11,
+};
+const MONTH_INDEX_AR: Record<string, number> = {
+  'يناير': 0, 'فبراير': 1, 'مارس': 2, 'أبريل': 3, 'مايو': 4, 'يونيو': 5, 'يوليو': 6,
+  'أغسطس': 7, 'سبتمبر': 8, 'أكتوبر': 9, 'نوفمبر': 10, 'ديسمبر': 11,
+};
+
+const STATEMENT_KEYWORD_EN = /\bstatement\b/i;
+const STATEMENT_KEYWORD_AR = /كشف\s*(حساب|الحساب)?/;
+
+function parseNamedMonthPeriod(content: string, isArabic: boolean): { periodStart: Date; periodEnd: Date } | null {
+  if (isArabic ? STATEMENT_RELATIVE_PERIOD_AR.test(content) : STATEMENT_RELATIVE_PERIOD_EN.test(content)) return null;
+  const match = isArabic ? STATEMENT_MONTH_NAMES_AR.exec(content) : STATEMENT_MONTH_NAMES_EN.exec(content);
+  if (!match) return null;
+  const table = isArabic ? MONTH_INDEX_AR : MONTH_INDEX_EN;
+  const monthIndex = table[match[0].toLowerCase()];
+  if (monthIndex === undefined) return null;
+  const now = new Date();
+  const year = monthIndex <= now.getUTCMonth() ? now.getUTCFullYear() : now.getUTCFullYear() - 1;
+  const periodStart = new Date(Date.UTC(year, monthIndex, 1, 0, 0, 0, 0));
+  const periodEnd = new Date(Date.UTC(year, monthIndex + 1, 0, 23, 59, 59, 999));
+  return { periodStart, periodEnd };
+}
+
 /** Known-safe BadRequestException text (e.g. "this card is reported lost/stolen — request a
  *  replacement instead") from the tool handlers themselves passes through for English; anything
  *  else (or Arabic, since these messages aren't localized) falls back to a generic safe line. */
@@ -964,30 +1076,6 @@ function formatGenericForcedFailureReply(error: unknown, isArabic: boolean): str
     : "I couldn't complete that just now — would you like to speak with a human agent?";
 }
 
-/** Mirrors formatTransferActionReply — built entirely from the REAL tool result, never from
- *  Qwen's own wording, and voice-concise per this feature's own "keep the response concise,
- *  don't read the statement contents" requirement. */
-function formatStatementEmailReply(result: unknown, isArabic: boolean): string {
-  const data = result as { success: boolean; alreadySent?: boolean; reason?: string };
-  if (data.success && data.alreadySent) {
-    return isArabic
-      ? 'تم إرسال هذا الكشف بالفعل إلى بريدك الإلكتروني المسجل.'
-      : "I've already sent that statement to your registered email address.";
-  }
-  if (data.success) {
-    return isArabic
-      ? 'تم إرسال كشف حسابك إلى بريدك الإلكتروني المسجل.'
-      : 'Your bank statement has been sent to your registered email address.';
-  }
-  if (data.reason === 'NO_REGISTERED_EMAIL') {
-    return isArabic
-      ? 'لا يوجد بريد إلكتروني مسجل في حسابك، لذا لا يمكنني إرسال الكشف بهذه الطريقة حاليًا.'
-      : "I don't have a registered email address on file for your account, so I can't send the statement that way right now.";
-  }
-  return isArabic
-    ? 'تعذر إرسال كشف الحساب إلى بريدك الإلكتروني الآن. يرجى المحاولة مرة أخرى لاحقًا.'
-    : "I wasn't able to send the statement to your registered email right now. Please try again later.";
-}
 
 function formatStatementEmailFailureReply(error: unknown, isArabic: boolean): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -996,10 +1084,36 @@ function formatStatementEmailFailureReply(error: unknown, isArabic: boolean): st
       ? 'ليس لدي كشف حساب جاهز حتى الآن — هل يمكنك تحديد الفترة التي تحتاجها؟'
       : "I don't have a statement ready to send yet — could you tell me which period you need?";
   }
+  // CONFIRMED LIVE (2026-09-28, real PSTN call with Ahmed): this was the ACTUAL failure a real
+  // customer hit — never verified this call, so the send correctly failed, but the reply just
+  // said "I couldn't send it — human agent?" with no explanation or path forward. The main
+  // forced-confirmation block now checks verification level BEFORE attempting the send (see its
+  // own comment), so this branch should rarely trigger anymore — kept as defense-in-depth for
+  // any path that still reaches this catch directly.
+  if (error instanceof InsufficientVerificationException || /insufficient verification/i.test(message)) {
+    return isArabic
+      ? 'قبل أن أتمكن من إرسال ذلك، أحتاج إلى التحقق من هويتك أولاً.'
+      : "Before I can send that, I need to verify your identity first.";
+  }
   return isArabic
     ? 'تعذر إرسال كشف الحساب الآن. هل ترغب بالتحدث مع أحد الموظفين؟'
     : "I couldn't send the statement just now — would you like to speak with a human agent?";
 }
+
+// CONFIRMED LIVE BUG (2026-09-28, real test call with Ahmed): Qwen called send_statement_by_email
+// entirely on its own initiative, within its normal free-decision tool loop, in response to an
+// AMBIGUOUS customer reply ("Good.") that was never an explicit confirmation — and the real email
+// genuinely sent, while Qwen's own spoken reply that same turn STILL asked "Would you like me to
+// send it via email now?" as if it hadn't happened yet. Every other high-risk action in this file
+// (transfer confirm, PIN/password reset completion) relies on Qwen's own tool description plus
+// the deterministic forced-detector as the primary safety net for the common case — but that still
+// leaves Qwen free to choose to call the tool itself whenever it decides to, and this is now a
+// confirmed instance of that discretion misfiring for a real send with no verbal undo once it's
+// out. Rather than trust prompting alone (already proven insufficient here), this tool is removed
+// from what Qwen can even see/choose in its own decision loop (see toolSchemas below) — it still
+// exists, is still permitted, and still fully executes, but ONLY via the deterministic forced-
+// confirmation detector, which is backend-decided and never asks the model whether to call it.
+const TOOLS_HIDDEN_FROM_MODEL: string[] = ['send_statement_by_email'];
 
 const ZERO_ARG_FORCED_TOOLS: ZeroArgForcedTool[] = [
   {
@@ -1058,6 +1172,9 @@ const ZERO_ARG_FORCED_TOOLS: ZeroArgForcedTool[] = [
     patternsAr: [/حالة\s+شكواي/, /قضيتي/],
     formatReply: formatCasesReply,
   },
+  // request_statement is NOT in this table — unlike every other entry here, it sometimes needs
+  // computed args (a parsed month), not just {} — see its own bespoke block above the generic
+  // loop below, right after the pending-statement-email-confirmation block.
 ];
 
 // ============================================================================================
@@ -1106,19 +1223,21 @@ const ACTION_REQUIRED_CATEGORIES: ActionRequiredCategory[] = [
     clarificationEn: "What's the beneficiary's name and account number?",
     clarificationAr: 'ما اسم المستفيد ورقم حسابه؟',
   },
+  // A 'statement_request' entry lived here (added 2026-09-23), then was removed as "superseded"
+  // once request_statement moved into ZERO_ARG_FORCED_TOOLS (2026-09-28) — but that removal was
+  // wrong for any message naming a SPECIFIC period ("June", "last 3 months", ...): the zero-arg
+  // path now deliberately skips those (see hasExplicitStatementPeriod), so they fall all the way
+  // through to the normal model-decision loop with no safety net at all otherwise. Re-added, but
+  // scoped in practice to exactly that fallthrough case — a default-period statement mention
+  // never reaches this post-check to begin with, since the zero-arg path already set
+  // forcedStateReply and short-circuited enteredModelDecisionLoop before this ever runs.
   {
-    // CONFIRMED LIVE (2026-09-23, statement default-period feature): a genuine "I want my bank
-    // statement" narrated "I'll create the request now" with no tool call at all this turn.
-    // Statement requests were never covered by this safety net before (only transfer_creation/
-    // fraud_report/add_beneficiary were) — same failure family, same fix. The clarification here
-    // deliberately does NOT ask which period (that would defeat the whole point of the new
-    // last-calendar-month default) — it's a plain yes/no nudge instead.
     name: 'statement_request',
     patternsEn: [/\bstatement\b/i],
     patternsAr: [/كشف\s*(حساب|الحساب)?/],
     requiredToolNames: ['request_statement'],
-    clarificationEn: "I can prepare your statement for last month — would you like me to go ahead?",
-    clarificationAr: 'يمكنني تجهيز كشف حسابك عن الشهر الماضي — هل ترغب أن أستمر؟',
+    clarificationEn: 'Which period would you like that statement for — a specific month, or the last calendar month?',
+    clarificationAr: 'ما هي الفترة التي تريد كشف الحساب لها — شهر معين، أم آخر شهر ميلادي؟',
   },
 ];
 
@@ -1566,26 +1685,90 @@ export class OrchestratorService {
     // action — isn't covered by the former). A short NEGATIVE reply intentionally falls through
     // unchanged (nothing needs to be "cancelled" — a generated, un-emailed statement is harmless
     // to just leave sitting there for later).
+    //
+    // LATENCY FIX + BETTER FAILURE HANDLING (2026-09-28, real PSTN call with Ahmed): two confirmed
+    // live problems fixed together, because the fix for one enables the fix for the other.
+    // (1) Unlike every other forced-tool reply in this file (all a single fast MySQL read), the
+    // real send involves generating a PDF and a genuine SMTP round trip to Gmail — slow enough
+    // that the customer would sit in silence for it. (2) The real call's actual failure
+    // ("Insufficient verification level" — never verified that call) got a generic, unhelpful
+    // "I couldn't send it — human agent?" with no path forward.
+    // Fixed by splitting into a cheap SYNCHRONOUS pre-check (verification level, then registered
+    // email — both fast DB reads already available) for anything we can already tell will fail,
+    // answered honestly and helpfully right away; only once both checks pass does this speak an
+    // immediate, honest ACKNOWLEDGMENT OF INTENT ("I'll send that now" — never "it has been
+    // sent", so this never overclaims) and hand the real send to the background — fire-and-
+    // forget, the exact same pattern classificationPromise elsewhere in this file already uses
+    // for "don't block the customer-facing reply on work that doesn't need to finish first". The
+    // real outcome still lands for real in StatementRequest.emailSentAt / the Notification row
+    // by the time anyone checks — nothing here weakens "never claim success before it's real".
     if (forcedStateReply === undefined && allowedTools.includes('send_statement_by_email')) {
       const pendingStatement = await this.statements.getActivePendingEmail(customerId, conversationId);
       if (pendingStatement) {
         const intent = detectTransferReplyIntent(content, customerWroteArabic);
         const confirmed = intent === 'confirm' || detectSendConfirmIntent(content, customerWroteArabic);
         if (confirmed) {
-          try {
-            const result = await this.toolRegistry.validateAndExecute('send_statement_by_email', {}, {
-              requestId,
-              actor,
-              customerId,
-              conversationId,
-              allowedTools,
-              verificationLevel,
-            });
-            forcedStateReply = formatStatementEmailReply(result, customerWroteArabic);
-          } catch (error) {
-            forcedStateReply = formatStatementEmailFailureReply(error, customerWroteArabic);
+          if (verificationLevel < VerificationLevel.VERIFIED) {
+            const hasPendingCode = await this.verification.hasPendingCode(customerId, conversationId);
+            if (!hasPendingCode && allowedTools.includes('start_verification')) {
+              await this.toolRegistry
+                .validateAndExecute('start_verification', {}, { requestId, actor, customerId, conversationId, allowedTools, verificationLevel })
+                .catch(() => undefined);
+            }
+            forcedStateReply = customerWroteArabic
+              ? 'قبل أن أتمكن من إرسال ذلك، أحتاج إلى التحقق من هويتك أولاً — لقد أرسلت لك رمزًا، هل يمكنك تزويدي به؟'
+              : "Before I can send that, I need to verify your identity first — I've sent you a code, could you read it out for me?";
+            forcedStateToolCalled = 'start_verification';
+          } else {
+            const customerRecord = await this.prisma.customer.findUnique({ where: { id: customerId }, select: { email: true } });
+            if (!customerRecord?.email) {
+              forcedStateReply = customerWroteArabic
+                ? 'لا يوجد بريد إلكتروني مسجل في حسابك، لذا لا يمكنني إرسال الكشف بهذه الطريقة حاليًا.'
+                : "I don't have a registered email address on file for your account, so I can't send the statement that way right now.";
+            } else {
+              forcedStateReply = customerWroteArabic
+                ? 'حسنًا، أنا أرسل ذلك إلى بريدك الإلكتروني المسجل الآن. إذا لم تستلمه خلال بضع دقائق، يرجى التواصل معنا.'
+                : "Okay, I'm sending that to your registered email address now — if you don't receive it in a few minutes, please reach out to us.";
+              this.toolRegistry
+                .validateAndExecute('send_statement_by_email', {}, { requestId, actor, customerId, conversationId, allowedTools, verificationLevel })
+                .catch((error) => {
+                  this.logger.warn(
+                    `Background send_statement_by_email failed after the customer was already told it was starting: ${error instanceof Error ? error.message : error}`,
+                  );
+                });
+            }
+            forcedStateToolCalled = 'send_statement_by_email';
           }
-          forcedStateToolCalled = 'send_statement_by_email';
+        }
+      }
+    }
+    // STATEMENT REQUEST (2026-09-28) — its own bespoke block, not in ZERO_ARG_FORCED_TOOLS below,
+    // because unlike every other entry there it sometimes needs COMPUTED args, not just {}: a
+    // bare month name gets deterministically parsed (parseNamedMonthPeriod, see its own doc
+    // comment above for the real off-by-one bug this closes) and passed as real period_start/
+    // period_end; no period at all falls back to the tool's own last-calendar-month default; only
+    // a genuinely complex relative period (an explicit range, "last 3 months", ...) still falls
+    // through to Qwen's own free-decision loop, which can parse it (imperfectly, but that's a
+    // narrower and rarer surface than the two deterministic cases just closed).
+    if (forcedStateReply === undefined && allowedTools.includes('request_statement')) {
+      const matchesStatementKeyword = customerWroteArabic ? STATEMENT_KEYWORD_AR.test(content) : STATEMENT_KEYWORD_EN.test(content);
+      if (matchesStatementKeyword) {
+        const namedMonth = parseNamedMonthPeriod(content, customerWroteArabic);
+        const shouldForceDefault = !namedMonth && !hasExplicitStatementPeriod(content, customerWroteArabic);
+        if (namedMonth || shouldForceDefault) {
+          try {
+            const result = await this.toolRegistry.validateAndExecute(
+              'request_statement',
+              namedMonth
+                ? { period_start: namedMonth.periodStart.toISOString().slice(0, 10), period_end: namedMonth.periodEnd.toISOString().slice(0, 10) }
+                : {},
+              { requestId, actor, customerId, conversationId, allowedTools, verificationLevel },
+            );
+            forcedStateReply = formatStatementRequestReply(result, customerWroteArabic);
+          } catch (error) {
+            forcedStateReply = formatGenericForcedFailureReply(error, customerWroteArabic);
+          }
+          forcedStateToolCalled = 'request_statement';
         }
       }
     }
@@ -1669,6 +1852,13 @@ export class OrchestratorService {
     const useForcedToolPath = detectedTools.length > 0 && Object.keys(forcedToolResults).length === detectedTools.length;
 
     const extraContext: string[] = [];
+    // CONFIRMED LIVE BUG (2026-09-28): DEFAULT_SYSTEM_INSTRUCTIONS is a static string built once
+    // at module load — it can never carry "today's date" correctly. With no date anchor anywhere
+    // in its context, Qwen guessed a bare month name ("my statement for June") as June 2024
+    // instead of the current year, on a real call in September 2026. Computed fresh per turn
+    // (unlike the static system prompt) and pushed unconditionally — cheap (one line of prompt
+    // text, no extra tool call) and relevant to any relative-date reasoning, not just statements.
+    extraContext.push(`Today's date is ${new Date().toISOString().slice(0, 10)}.`);
     if (isVoiceChannel) extraContext.push(VOICE_STYLE_DIRECTIVE);
     if (Object.keys(forcedToolResults).length > 0) extraContext.push(formatTrustedAccountData(forcedToolResults));
     const memoryContext = await memoryContextPromise;
@@ -1705,7 +1895,10 @@ export class OrchestratorService {
     // RULES). The loop below still runs exactly once in this case: with no tools to call,
     // iteration 0's response always has content, never toolCalls, so the loop's own
     // `finalText === undefined` condition ends it immediately — no separate code path needed.
-    const toolSchemas = useForcedToolPath || forcedStateReply !== undefined ? [] : this.toolRegistry.getSchemasFor(allowedTools);
+    const toolSchemas =
+      useForcedToolPath || forcedStateReply !== undefined
+        ? []
+        : this.toolRegistry.getSchemasFor(allowedTools).filter((schema) => !TOOLS_HIDDEN_FROM_MODEL.includes(schema.name));
     const messages = this.contextBuilder.build(conversation.messages, systemInstructions, extraContext);
 
     // A general "mirror the customer's language" rule in the system prompt, or even a fresh
@@ -1917,6 +2110,10 @@ export class OrchestratorService {
     // FAILED call the same as a real one and trusted the reply. This tracks successes only,
     // separately, and both checks below gate on this list instead.
     const toolsSucceededThisTurn: string[] = [];
+    // Captured alongside toolsSucceededThisTurn (see override further down, right after the loop)
+    // — the real tool result, not just the fact it succeeded, so the reply can be rebuilt from it
+    // rather than trusting Qwen's own narration of a request_statement outcome.
+    let lastRequestStatementResult: unknown;
 
     for (let iteration = 0; iteration < this.MAX_TOOL_ITERATIONS && finalText === undefined; iteration++) {
       // Idempotent past iteration 0 (resolving an already-resolved promise is a no-op) — must run
@@ -2164,6 +2361,7 @@ export class OrchestratorService {
               verificationLevel: currentVerificationLevel,
             });
             toolsSucceededThisTurn.push(call.name);
+            if (call.name === 'request_statement') lastRequestStatementResult = resultPayload;
           } catch (error) {
             // Backend-owned authorization boundary (see VerificationLevel/minVerificationLevel):
             // Qwen requested a tool it isn't currently allowed to run — never silently ignored,
@@ -2202,6 +2400,21 @@ export class OrchestratorService {
             resultState = TERMINAL_TOOL_STATES[call.name]!;
           }
         }
+        // LATENCY FIX (2026-09-28, confirmed live — an ~11s reply for a single statement
+        // request): once request_statement succeeds, its result already contains everything the
+        // customer needs (status, downloadUrl, requestNumber, periodStart/periodEnd) — there is
+        // nothing left for another tool call to usefully add. Confirmed live: Qwen still spent a
+        // WHOLE extra tool-decision round trip (~4s of LLM time, plus its own GPU-queue wait)
+        // calling get_statement immediately afterward, purely to "double check" the very thing it
+        // just created. Ending the turn here — same as the zero-arg fast path already does, and
+        // reusing the exact same template (see the post-loop override above, which this makes
+        // largely redundant for THIS case but still covers request_statement succeeding on a
+        // later iteration) — removes the entire extra round trip at its root, rather than trying
+        // to prompt Qwen out of a decision it kept making anyway.
+        if (lastRequestStatementResult !== undefined) {
+          finalText = formatStatementRequestReply(lastRequestStatementResult, customerWroteArabic);
+          break;
+        }
         continue;
       }
 
@@ -2222,6 +2435,22 @@ export class OrchestratorService {
         ? 'دعني أحوّلك إلى أحد موظفي الدعم البشري الذين يمكنهم تقديم مزيد من المساعدة.'
         : 'Let me connect you with a human agent who can help further.';
       resultState = 'ESCALATING';
+    }
+
+    // CONFIRMED LIVE BUG (2026-09-28, real PSTN call): once request_statement succeeds via this
+    // free model-decision loop (a customer-named period bypasses the zero-arg forced path — see
+    // hasExplicitStatementPeriod above), Qwen's own narration of the outcome was still fully
+    // free-form — and confirmed live to go wrong: right after an unrelated real email-send
+    // failure earlier the SAME call, Qwen told the customer "I was not able to send the statement
+    // for June" even though request_statement had just genuinely SUCCEEDED this turn (no send was
+    // even attempted) — it carried the earlier failure's framing onto a brand new, successful
+    // result instead of reporting what actually just happened. The correct reply for a successful
+    // request_statement is always the same fixed shape regardless of which path invoked it (fast
+    // zero-arg default, or Qwen-parsed explicit period here) — so this reuses the exact same
+    // deterministic template the fast path already uses. Qwen's own words for this one outcome
+    // are never trusted, exactly like every other high-risk tool result in this file.
+    if (enteredModelDecisionLoop && lastRequestStatementResult) {
+      finalText = formatStatementRequestReply(lastRequestStatementResult, customerWroteArabic);
     }
 
     // ACTION-REQUIRED POST-CHECK (2026-09-21, "first-ask" reliability pass): for a small set of

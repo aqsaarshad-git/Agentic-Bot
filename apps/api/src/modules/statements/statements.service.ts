@@ -21,7 +21,15 @@ export class StatementsService {
    *  the request and marks it READY immediately with a stub download URL, same as before. Real
    *  PDF generation happens on demand, only when actually needed for an email send (see
    *  sendStatementByEmail) — building it here too would mean generating a document for every
-   *  status-only inquiry that never gets delivered anywhere. */
+   *  status-only inquiry that never gets delivered anywhere.
+   *
+   *  CONFIRMED LIVE BUG (2026-09-28, real PSTN call with Ahmed): asked for a statement, offered
+   *  to email it, customer replied "Good" (not a clear yes) — Qwen called request_statement a
+   *  SECOND time for the exact same period instead of recognizing one was already generated
+   *  moments earlier in this same conversation, leaving two READY, un-emailed rows behind. Fixed
+   *  by reusing an existing match (same conversation + account + period, still READY and not yet
+   *  emailed) instead of blindly creating another — same idempotency principle already applied to
+   *  the email SEND step, just one layer earlier. */
   async request(params: {
     customerId: string;
     accountId: string;
@@ -30,6 +38,20 @@ export class StatementsService {
     format?: string;
     conversationId?: string;
   }) {
+    if (params.conversationId) {
+      const existing = await this.prisma.statementRequest.findFirst({
+        where: {
+          conversationId: params.conversationId,
+          accountId: params.accountId,
+          periodStart: params.periodStart,
+          periodEnd: params.periodEnd,
+          status: 'READY',
+          emailSentAt: null,
+        },
+        orderBy: { requestedAt: 'desc' },
+      });
+      if (existing) return existing;
+    }
     const requestNumber = this.generateRequestNumber();
     return this.prisma.statementRequest.create({
       data: {

@@ -72,7 +72,8 @@ const DEMO_CUSTOMERS: DemoCustomer[] = [
   {
     // Archetype A-adjacent (kept as-is: one historical failed/pending txn + healthy history).
     fullName: 'Ahmed Al-Rashid',
-    email: 'ahmed@example.com',
+    // Real Gmail address (2026-09-28) — statement-email delivery testing on a second real inbox.
+    email: 'aqsa10641064@gmail.com',
     phone: '+966501234567',
     language: 'ar',
     metadata: {

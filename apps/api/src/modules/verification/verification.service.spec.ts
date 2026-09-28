@@ -9,6 +9,7 @@ type MockPrisma = {
     update: jest.Mock;
   };
   customer: { findUnique: jest.Mock };
+  call: { findUnique: jest.Mock };
 };
 
 function makeSession(overrides: Partial<Record<string, unknown>> = {}) {
@@ -53,6 +54,11 @@ describe('VerificationService', () => {
         update: jest.fn(),
       },
       customer: { findUnique: jest.fn().mockResolvedValue({ id: 'cust-1', email: 'a@b.com' }) },
+      // Defaults to "no Call row" (i.e. not a PSTN conversation) so every existing test below
+      // keeps exercising the OTP-based path exactly as before — see the new
+      // 'PSTN calls skip OTP verification entirely' describe block for the new channel-aware
+      // policy's own dedicated tests.
+      call: { findUnique: jest.fn().mockResolvedValue(null) },
     };
     auditService = { log: jest.fn().mockResolvedValue(undefined) };
     notifications = { send: jest.fn().mockResolvedValue(undefined) };
@@ -82,6 +88,30 @@ describe('VerificationService', () => {
 
     it('returns PUBLIC with no customerId', async () => {
       expect(await service.computeLevel('', 'conv-1')).toBe(0);
+    });
+  });
+
+  // Real, explicit policy request (2026-09-28, after a real PSTN call review): a real phone call
+  // already proves identity via the backend-owned dial/caller-ID match, so OTP verification is
+  // skipped entirely for that channel — but ONLY that channel, not chat/browser voice.
+  describe('PSTN calls skip OTP verification entirely', () => {
+    it('returns VERIFIED immediately for a PSTN-linked conversation, with no verification session at all', async () => {
+      prisma.call.findUnique.mockResolvedValue({ transport: 'PSTN' });
+      prisma.verificationSession.findFirst.mockResolvedValue(null);
+      expect(await service.computeLevel('cust-1', 'conv-1')).toBe(2); // VERIFIED
+      expect(prisma.verificationSession.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('does NOT apply to a WEBRTC (browser voice) conversation — still requires real OTP verification', async () => {
+      prisma.call.findUnique.mockResolvedValue({ transport: 'WEBRTC' });
+      prisma.verificationSession.findFirst.mockResolvedValue(null);
+      expect(await service.computeLevel('cust-1', 'conv-1')).toBe(1); // AUTHENTICATED, not VERIFIED
+    });
+
+    it('does NOT apply to a plain text/chat conversation (no Call row at all)', async () => {
+      prisma.call.findUnique.mockResolvedValue(null);
+      prisma.verificationSession.findFirst.mockResolvedValue(null);
+      expect(await service.computeLevel('cust-1', 'conv-1')).toBe(1); // AUTHENTICATED, not VERIFIED
     });
   });
 

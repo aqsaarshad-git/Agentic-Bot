@@ -32,10 +32,30 @@ export class VerificationService {
     private readonly auditService: AuditService,
   ) {}
 
-  /** The authorization tier a turn should run with — computed fresh every time, never cached. */
+  /**
+   * The authorization tier a turn should run with — computed fresh every time, never cached.
+   *
+   * POLICY (2026-09-28, explicit request after a real PSTN call): a real phone call already
+   * proves identity by itself — the backend dialed OUT to this exact, already-known customerId
+   * (PstnCallService.dial/dialMe — never Qwen-chosen), or an INBOUND call's caller-ID number
+   * matched this exact customer (findOrCreateCustomerByPhone) — either way, established BEFORE
+   * Qwen ever said a word, by the same backend-owned mechanism this whole project already treats
+   * as authoritative for identity everywhere else. Asking the customer to ALSO read a 6-digit
+   * code out loud over the phone for sensitive actions was redundant friction on top of an
+   * identity already proven, not an extra real security boundary — the actual boundary is "which
+   * number rang / was rung", decided entirely outside this check either way. Scoped to PSTN
+   * specifically, not browser voice or chat — neither of those has an equivalent real-world "the
+   * phone network already connected exactly this person" guarantee, so they still go through the
+   * OTP step below unchanged.
+   */
   async computeLevel(customerId: string, conversationId: string | undefined): Promise<VerificationLevel> {
     if (!customerId) return VerificationLevel.PUBLIC;
     if (!conversationId) return VerificationLevel.AUTHENTICATED;
+
+    const call = await this.prisma.call.findUnique({ where: { conversationId }, select: { transport: true } });
+    if (call?.transport === 'PSTN') {
+      return VerificationLevel.VERIFIED;
+    }
 
     const session = await this.prisma.verificationSession.findFirst({
       where: { customerId, conversationId, purpose: 'IDENTITY' },

@@ -34,6 +34,18 @@ export class SmtpEmailProvider implements EmailProvider {
         user: config.get<string>('mail.username'),
         pass: config.get<string>('mail.password'),
       },
+      // LATENCY (2026-09-28, real-call review — customer asked to "make it in a better
+      // latency"): without pooling, every single send pays a fresh TCP+TLS handshake and a full
+      // Gmail SMTP AUTH round trip from zero, on top of the message itself — real, measurable
+      // time that has nothing to do with this message's own size. Pooling keeps a small number
+      // of already-authenticated connections open and reuses them across sends (this provider is
+      // a Nest singleton, so the pool lives for the process's lifetime) — the first send after a
+      // cold start still pays the full cost, but every send after that is faster. Real send is
+      // already backgrounded (fire-and-forget) so this isn't customer-facing wait time either
+      // way, but a faster real send still means the email itself arrives sooner.
+      pool: true,
+      maxConnections: 3,
+      maxMessages: 100,
     });
   }
 
