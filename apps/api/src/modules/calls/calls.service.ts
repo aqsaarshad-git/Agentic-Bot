@@ -341,30 +341,36 @@ export class CallsService {
     // The STT provider has no auto-detect and only understands "ar"|"en" (see
     // cohere-arabic-stt.provider.ts) — asked in the wrong language it doesn't fail, it
     // hallucinates plausible-looking nonsense IN that language, so a single guess can't
-    // always be trusted blindly. Turn ONE of every call still pays for the full
-    // dual-transcribe-and-judge path (nothing is confirmed yet, and a customer's profile
-    // default is just a guess — see the cold-start bug this was fixed for). From turn two
-    // onward, though, paying for a second Cohere STT call AND an LLM judge call on every
-    // single turn is wasted work in the common case where the customer just keeps speaking
-    // whatever language they already confirmed — see resolveTranscript() below for the fast
-    // single-call path used once a language is known, with a cheap same-result self-check
-    // that still catches a genuine mid-call language switch (rare) and falls back to the full
-    // dual-transcribe+judge path when it fires, rather than trusting a stale language forever.
-    // A same-day variant that always compared both languages (catching a switch immediately
-    // instead of within a turn or two) was tried and reverted at the user's request — the real
-    // per-turn latency cost (every turn, not just occasionally) outweighed the reliability
-    // gain; see resolveTranscript's own note for specifics.
+    // always be trusted blindly. Paying for a second Cohere STT call AND an LLM judge call on
+    // every single turn is wasted work in the common case where the customer just keeps
+    // speaking whatever language they already confirmed — see resolveTranscript() below for the
+    // fast single-call path, with a cheap same-result self-check that still catches a genuine
+    // mid-call language switch (rare) and falls back to the full dual-transcribe+judge path
+    // when it fires, rather than trusting a stale/guessed language forever.
+    //
+    // CHANGED (2026-09-28, explicit customer request, accepted risk): turn ONE of every call
+    // used to always pay for the full dual-transcribe-and-judge path unconditionally, since
+    // nothing is confirmed yet and a customer's profile default is just a guess (see the
+    // cold-start bug this was originally fixed for). It now takes the SAME fast single-call path
+    // as every other turn, forced to the account's own profile-default language as a guess —
+    // faster on the common case (a correct guess), but a wrong guess is only caught if the
+    // self-check below actually fires; see resolveTranscript's own 2026-09-28 note for exactly
+    // what that does and doesn't catch. This was an explicit, informed trade-off, not an
+    // oversight — do not "fix" this back without checking with the customer first.
+    //
+    // A same-day (2026-09-11) variant that always compared both languages on EVERY turn
+    // (catching a switch immediately instead of within a turn or two) was tried and reverted at
+    // the user's request — the real per-turn latency cost (every turn, not just turn one)
+    // outweighed the reliability gain; see resolveTranscript's own note for specifics. That
+    // revert is unrelated to, and unaffected by, today's turn-one change above.
     const hasPriorTurn = Boolean(await this.prisma.callTranscript.findUnique({ where: { callId: call.id } }));
     const knownLanguage = hasPriorTurn ? (call.language as 'en' | 'ar' | null) : null;
-    // BUG FIX (2026-09-14, confirmed live): `call.language` already holds the account's own
-    // profile default from the moment the call starts (see resolveCustomerLanguage) — genuinely
-    // useful as a tie-breaker for a short, truly ambiguous turn-one greeting ("Hello" vs "ألو"
-    // are both short and plausible; content alone can't always decide), which is exactly what
-    // an existing comment inside pickSpokenLanguage already argued for. But it was never
-    // actually reachable: `knownLanguage` above is deliberately null on turn one (correctly
-    // gating the FAST PATH, which really must stay off until a language is confirmed), and that
-    // same null was also being handed to the judge as "no hint at all." Separating "gates the
-    // fast path" from "hint for the judge" fixes this without touching the fast-path gating.
+    // `call.language` already holds the account's own profile default from the moment the call
+    // starts (see resolveCustomerLanguage) — used both as resolveTranscript's turn-one GUESS
+    // (see the 2026-09-28 note above) and, separately, as pickSpokenLanguage's tie-breaker hint
+    // when the full dual-transcribe+judge path actually runs (kept deliberately separate from
+    // `knownLanguage`, which must stay null on turn one for the "nothing is CONFIRMED yet"
+    // diagnostics/switchDetected logic elsewhere to stay correct).
     const accountDefaultLanguage: 'en' | 'ar' = call.language === 'ar' ? 'ar' : 'en';
     const sttStartedAt = Date.now();
     const { text: transcriptText, language: detectedLanguage, path: sttPath, diagnostics: langDiag } = await this.resolveTranscript(
@@ -932,10 +938,13 @@ export class CallsService {
   }
 
   /**
-   * Resolves one utterance's transcript, taking the fast single-STT-call path whenever the
-   * call's language is already known (confirmed by an earlier turn this call) and falling
-   * back to the full dual-transcribe-and-judge path otherwise (turn one of every call, or
-   * whenever the fast path's own self-check below smells a real mid-call language switch).
+   * Resolves one utterance's transcript via a single forced-language STT call — forced to the
+   * confirmed language once one exists (an earlier turn this call), or (since 2026-09-28,
+   * explicit customer request — see the fuller note inline below) a GUESS of the customer's own
+   * account/profile language on turn one, when nothing is confirmed yet. Falls back to the full
+   * dual-transcribe-and-judge path only when the fast attempt's own self-check below smells
+   * something wrong (empty result, or signs of the wrong language) — same mechanism either way,
+   * whether what's being re-checked is a real confirmation or just turn one's own guess.
    */
   private async resolveTranscript(
     audio: Buffer,
@@ -965,13 +974,25 @@ export class CallsService {
     // skipped the judge and still took ~1.8s; ambiguous ones correctly paid for it at
     // ~3.4-4.3s) but the real per-turn latency cost was materially worse than estimated when
     // proposing it, and was reverted at the user's explicit request rather than accepted as a
-    // permanent tradeoff. Back to: trust a single forced-language STT call once a language is
-    // "known" (confirmed by an earlier turn this call), falling back to the full
-    // dual-transcribe-and-judge path only for turn one or when the self-check below suspects a
-    // switch. This reopens the same blind spot noted at the time (a switch that Cohere
-    // mis-hears as fluent, correctly-scripted, but wrong-language text — e.g. a Latin
-    // transliteration of Arabic audio, or a fabricated English sentence — isn't guaranteed to
-    // be caught on the very next turn) — a conscious, reverted-back tradeoff, not an oversight.
+    // permanent tradeoff. Back to: trust a single forced-language STT call, falling back to the
+    // full dual-transcribe-and-judge path only when the self-check below suspects a switch.
+    // This reopens the same blind spot noted at the time (a switch that Cohere mis-hears as
+    // fluent, correctly-scripted, but wrong-language text — e.g. a Latin transliteration of
+    // Arabic audio, or a fabricated English sentence — isn't guaranteed to be caught on the
+    // very next turn) — a conscious, reverted-back tradeoff, not an oversight.
+    //
+    // CHANGED (2026-09-28, explicit customer request, accepted risk): turn one now ALSO takes
+    // this fast path instead of always paying for the full dual-transcribe+judge call — forced
+    // to `accountDefaultLanguage` (the customer's own profile language) as a GUESS rather than a
+    // confirmed language, reusing the exact same self-check below that already catches a
+    // suspected switch on later turns. This is a real, deliberate trade of some turn-one
+    // accuracy for turn-one speed: nothing is actually confirmed yet on turn one, so a wrong
+    // profile-language guess on an ambiguous first utterance is caught only if the self-check
+    // below actually fires (Arabic script appearing in an English-forced attempt, or none
+    // appearing in an Arabic-forced one) — a case that produces plausible-sounding text in
+    // BOTH languages (the exact failure mode dual-transcribe+judge existed to catch) can still
+    // slip through uncaught on turn one now, same as it already could on turn two onward. Told
+    // to the customer explicitly before implementing; this is not an oversight.
     //
     // BUG FIX (2026-09-14, confirmed live): `languageUnderSuspicion` tracks whether we're
     // escalating to the dual path specifically BECAUSE the cheap self-check below found
@@ -987,7 +1008,13 @@ export class CallsService {
     // otherwise fine) — it's actively counterproductive in the one case where the self-check
     // already found a real reason to doubt it.
     let languageUnderSuspicion = false;
-    if (knownLanguage) {
+    // Turn one has no confirmed language yet — `languageToTry` is a genuine GUESS in that case
+    // (the customer's own account/profile default), not a confirmed value; `knownLanguage`
+    // itself (used elsewhere for `previousConfirmedLanguage`/`switchDetected`) deliberately
+    // stays null on turn one so nothing downstream mistakes this guess for a real confirmation.
+    const languageToTry: 'en' | 'ar' = knownLanguage ?? accountDefaultLanguage;
+    const isGuess = knownLanguage === null;
+    {
       // AUDIT INSTRUMENTATION ONLY (2026-09-14 latency audit — no behavior change): same
       // queue-wait/call-duration breakdown as the dual path below, so the fast path's own
       // ~620ms average can be sanity-checked against real numbers too.
@@ -996,23 +1023,24 @@ export class CallsService {
         .run(async () => {
           const queueWaitMs = Date.now() - enqueuedAt;
           const callStartedAt = Date.now();
-          const r = await this.stt.transcribe(audio, { language: knownLanguage });
+          const r = await this.stt.transcribe(audio, { language: languageToTry });
           return { r, queueWaitMs, callMs: Date.now() - callStartedAt };
         })
         .catch((error) => {
-          this.logger.warn(`${knownLanguage.toUpperCase()} STT attempt failed: ${error instanceof Error ? error.message : error}`);
+          this.logger.warn(`${languageToTry.toUpperCase()} STT attempt failed: ${error instanceof Error ? error.message : error}`);
           return null;
         });
       this.logger.log(
-        `[LATENCY] fast-path STT breakdown: queueWait=${result?.queueWaitMs ?? 'n/a'}ms call=${result?.callMs ?? 'n/a'}ms`,
+        `[LATENCY] fast-path STT breakdown (${isGuess ? 'turn-1 guess' : 'confirmed'}): ` +
+          `queueWait=${result?.queueWaitMs ?? 'n/a'}ms call=${result?.callMs ?? 'n/a'}ms`,
       );
       let text = result?.r.text ?? '';
       if (isKnownSttHallucination(text)) {
-        this.logger.warn(`Fast STT path got a known stock-hallucination transcript (forced ${knownLanguage}) — discarding it as if empty`);
+        this.logger.warn(`Fast STT path got a known stock-hallucination transcript (forced ${languageToTry}) — discarding it as if empty`);
         text = '';
       }
       if (containsNonSpeechGarbage(text)) {
-        this.logger.warn(`Fast STT path got a non-speech-garbage transcript (forced ${knownLanguage}): ${JSON.stringify(text)} — discarding it as if empty`);
+        this.logger.warn(`Fast STT path got a non-speech-garbage transcript (forced ${languageToTry}): ${JSON.stringify(text)} — discarding it as if empty`);
         text = '';
       }
 
@@ -1024,16 +1052,18 @@ export class CallsService {
       // rendering Arabic and transcribes English text anyway even when forced into "ar")  —
       // in either case there's real signal something is wrong, so it's worth paying for the
       // full dual-transcribe+judge path just this once to re-confirm, rather than trusting a
-      // possibly-stale language for the rest of the call.
+      // possibly-stale language for the rest of the call. On turn one (isGuess) this is the
+      // ONLY thing standing between a wrong profile-language guess and an unvalidated result —
+      // see the 2026-09-28 comment above for exactly what it does and doesn't catch.
       const arabicScript = /[؀-ۿ]/;
-      const suspectedSwitch = knownLanguage === 'en' ? /[؀-ۿ]{2,}/.test(text) : text.trim().length > 0 && !arabicScript.test(text);
+      const suspectedSwitch = languageToTry === 'en' ? /[؀-ۿ]{2,}/.test(text) : text.trim().length > 0 && !arabicScript.test(text);
       diagnostics.suspectedSwitch = suspectedSwitch;
       diagnostics.fastPathText = text;
       diagnostics.fastQueueWaitMs = result?.queueWaitMs;
       diagnostics.fastCallMs = result?.callMs;
 
       if (!suspectedSwitch && text) {
-        return { text, language: knownLanguage, path: 'fast-single', diagnostics: { ...diagnostics, finalLanguage: knownLanguage, switchDetected: false } };
+        return { text, language: languageToTry, path: 'fast-single', diagnostics: { ...diagnostics, finalLanguage: languageToTry, switchDetected: false } };
       }
 
       if (!text) {
@@ -1048,10 +1078,10 @@ export class CallsService {
         // below instead — the same one every other uncertain case here already uses — gets the
         // same "try both languages" resilience this retry was for, but through the LLM judge's
         // duration-based hallucination check instead of trusting a single unvalidated guess.
-        this.logger.log(`Fast STT path got an empty ${knownLanguage} attempt — re-confirming with a full dual-transcribe instead of trusting an unvalidated retry`);
+        this.logger.log(`Fast STT path got an empty ${languageToTry} attempt — re-confirming with a full dual-transcribe instead of trusting an unvalidated retry`);
       } else {
         languageUnderSuspicion = true;
-        this.logger.log(`Fast STT path suspects a language switch (forced ${knownLanguage} gave ${JSON.stringify(text)}) — re-confirming with a full dual-transcribe`);
+        this.logger.log(`Fast STT path suspects a language switch (forced ${languageToTry} gave ${JSON.stringify(text)}) — re-confirming with a full dual-transcribe`);
       }
     }
 
