@@ -421,7 +421,15 @@ export class QwenProvider implements LlmProvider {
           'Content-Type': 'application/json',
           ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
         },
-        body: JSON.stringify({ model: this.model, messages: [], keep_alive: QWEN_KEEP_ALIVE }),
+        // BUG FIX (2026-10-01, free-form latency audit): this ping previously sent NO options, so
+        // Ollama treated it as a request for the model's DEFAULT context (4096) and reloaded the
+        // runner at that size (measured live: 6.4s, /api/ps context_length 16384 -> 4096). The very
+        // next real request asks for QWEN_NUM_CTX, which forced a SECOND reload (measured: 8.6s
+        // load + 2.6s full re-evaluation of the ~7.3k-token tool/system prefix = a 13.5s turn,
+        // versus ~2.5s warm). Since this cron fires every 5 minutes, one turn per tick paid that.
+        // Same num_ctx as real requests => no reload, KV cache kept (measured: 0.55s ping, next
+        // turn 2.5s with a cache hit).
+        body: JSON.stringify({ model: this.model, messages: [], keep_alive: QWEN_KEEP_ALIVE, options: { num_ctx: QWEN_NUM_CTX } }),
         signal: AbortSignal.timeout(QWEN_WARMUP_TIMEOUT_MS),
       });
       if (!res.ok) {

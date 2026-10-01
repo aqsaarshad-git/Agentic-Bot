@@ -2682,8 +2682,16 @@ export class OrchestratorService {
         // No resolvable agent config — still worth priming the default instructions (also
         // static) rather than skipping entirely; a real call would fall back the same way.
       }
-      const toolSchemas = this.toolRegistry.getSchemasFor(allowedTools);
-      const messages = this.contextBuilder.build([], systemInstructions, []);
+      // BUG FIX (2026-10-01, free-form latency audit): the prime must be byte-identical to a real
+      // turn's static prefix or it primes nothing. Confirmed live on a fresh call: the first real
+      // Qwen call missed the cache entirely (promptEvalDurationMs 4286, vs ~300 on a hit) minutes
+      // after the prime, because (1) real turns filter TOOLS_HIDDEN_FROM_MODEL out of the tool
+      // list (Qwen's template renders tools FIRST, so one differing tool breaks the prefix from
+      // that point on) and this prime didn't, and (2) real voice turns put the date line and
+      // VOICE_STYLE_DIRECTIVE right after the system prompt (only voice calls reach this method —
+      // see CallsService) and this prime left them out. Same inputs, same order as the real path.
+      const toolSchemas = this.toolRegistry.getSchemasFor(allowedTools).filter((schema) => !TOOLS_HIDDEN_FROM_MODEL.includes(schema.name));
+      const messages = this.contextBuilder.build([], systemInstructions, [`Today's date is ${new Date().toISOString().slice(0, 10)}.`, VOICE_STYLE_DIRECTIVE]);
       const response = await this.llm.generate(messages, toolSchemas, { label: 'cache-prime', priority: 'low', maxTokens: 1 });
       // Persisted (not just console-logged), same rationale as every other Qwen call's stats —
       // lets this be verified/queried from real calls instead of grepping console output.
