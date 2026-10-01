@@ -4,7 +4,7 @@ import { AccountsService } from '../../accounts/accounts.service';
 import { CardsService } from '../../cards/cards.service';
 import { ToolDefinition } from '../tool-definition.interface';
 import { VerificationLevel } from '../verification-level';
-import { requireCustomerId, toJsonSchema } from './shared';
+import { isoDate, requireCustomerId, toJsonSchema } from './shared';
 
 function mapCard(c: Card) {
   return {
@@ -15,6 +15,16 @@ function mapCard(c: Card) {
     expiryMonth: c.expiryMonth,
     expiryYear: c.expiryYear,
     activationRequired: c.status === 'PENDING_ACTIVATION',
+    // Why the card is in its current state and, for a replacement, what it replaces — the
+    // fields needed to answer "why is my card blocked" / "is this a replacement card" without
+    // guessing. No shipping/delivery tracking exists in this system, so a replacement's status
+    // is only ever ACTIVE/PENDING_ACTIVATION/PENDING_REPLACEMENT — never a fabricated ETA.
+    blockReason: c.blockReason ?? undefined,
+    lostReportedAt: c.lostReportedAt ? isoDate(c.lostReportedAt) : undefined,
+    stolenReportedAt: c.stolenReportedAt ? isoDate(c.stolenReportedAt) : undefined,
+    replacesCardId: c.replacesCardId ?? undefined,
+    dailyPurchaseLimit: Number(c.dailyPurchaseLimit),
+    dailyAtmLimit: Number(c.dailyAtmLimit),
   };
 }
 
@@ -26,6 +36,13 @@ function mapCard(c: Card) {
 const CARD_ID_DESC = {
   type: 'string',
   description: 'Exact cardId from get_cards/get_card. Optional if the customer has only one card (auto-resolves) — never invent one.',
+};
+
+// Resolves "the card ending in 7712" from the customer's OWN masked numbers (see
+// CardsService.resolveForCustomer) — only used when card_id isn't already known.
+const CARD_LAST4_DESC = {
+  type: 'string',
+  description: 'Last 4 digits, if the customer identified the card that way (e.g. "the one ending in 7712") and card_id is unknown.',
 };
 
 export function buildCardTools(accounts: AccountsService, cards: CardsService): ToolDefinition[] {
@@ -48,22 +65,22 @@ export function buildCardTools(accounts: AccountsService, cards: CardsService): 
     {
       name: 'get_card',
       description: "Get details of one of the customer's cards.",
-      inputSchema: z.object({ card_id: z.string().optional() }),
-      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC }, []),
+      inputSchema: z.object({ card_id: z.string().optional(), card_last4: z.string().optional() }),
+      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC, card_last4: CARD_LAST4_DESC }, []),
       idempotent: true,
       handler: async (ctx, args) => {
-        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id);
+        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id, args.card_last4);
         return mapCard(card);
       },
     },
     {
       name: 'activate_card',
       description: 'Activate a new card that is pending activation.',
-      inputSchema: z.object({ card_id: z.string().optional() }),
-      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC }, []),
+      inputSchema: z.object({ card_id: z.string().optional(), card_last4: z.string().optional() }),
+      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC, card_last4: CARD_LAST4_DESC }, []),
       minVerificationLevel: VerificationLevel.VERIFIED,
       handler: async (ctx, args) => {
-        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id);
+        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id, args.card_last4);
         const updated = await cards.activate(card.id);
         return mapCard(updated);
       },
@@ -71,13 +88,13 @@ export function buildCardTools(accounts: AccountsService, cards: CardsService): 
     {
       name: 'block_card',
       description: "Block the customer's card, e.g. if they suspect misuse or simply want it temporarily disabled.",
-      inputSchema: z.object({ card_id: z.string().optional(), reason: z.string().optional() }),
+      inputSchema: z.object({ card_id: z.string().optional(), card_last4: z.string().optional(), reason: z.string().optional() }),
       parametersJsonSchema: toJsonSchema(
-        { card_id: CARD_ID_DESC, reason: { type: 'string', description: 'Why the card is being blocked' } },
+        { card_id: CARD_ID_DESC, card_last4: CARD_LAST4_DESC, reason: { type: 'string', description: 'Why the card is being blocked' } },
         [],
       ),
       handler: async (ctx, args) => {
-        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id);
+        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id, args.card_last4);
         const updated = await cards.block(card.id, args.reason);
         return mapCard(updated);
       },
@@ -85,11 +102,11 @@ export function buildCardTools(accounts: AccountsService, cards: CardsService): 
     {
       name: 'unblock_card',
       description: 'Unblock a previously blocked card, if policy allows (not lost, stolen, or expired).',
-      inputSchema: z.object({ card_id: z.string().optional() }),
-      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC }, []),
+      inputSchema: z.object({ card_id: z.string().optional(), card_last4: z.string().optional() }),
+      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC, card_last4: CARD_LAST4_DESC }, []),
       minVerificationLevel: VerificationLevel.VERIFIED,
       handler: async (ctx, args) => {
-        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id);
+        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id, args.card_last4);
         const updated = await cards.unblock(card.id);
         return mapCard(updated);
       },
@@ -97,14 +114,14 @@ export function buildCardTools(accounts: AccountsService, cards: CardsService): 
     {
       name: 'replace_card',
       description: 'Request a replacement for a damaged or expired card (not lost/stolen — use report_lost_card or report_stolen_card for those).',
-      inputSchema: z.object({ card_id: z.string().optional(), reason: z.string().optional() }),
+      inputSchema: z.object({ card_id: z.string().optional(), card_last4: z.string().optional(), reason: z.string().optional() }),
       parametersJsonSchema: toJsonSchema(
-        { card_id: CARD_ID_DESC, reason: { type: 'string', description: 'Why a replacement is needed' } },
+        { card_id: CARD_ID_DESC, card_last4: CARD_LAST4_DESC, reason: { type: 'string', description: 'Why a replacement is needed' } },
         [],
       ),
       minVerificationLevel: VerificationLevel.VERIFIED,
       handler: async (ctx, args) => {
-        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id);
+        const card = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id, args.card_last4);
         const replacement = await cards.replace(card.id, args.reason);
         return { requested: true, replacementCard: mapCard(replacement) };
       },
@@ -112,10 +129,10 @@ export function buildCardTools(accounts: AccountsService, cards: CardsService): 
     {
       name: 'report_lost_card',
       description: "Report the card lost — immediately blocks it and requests a replacement. Urgent, don't delay.",
-      inputSchema: z.object({ card_id: z.string().optional() }),
-      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC }, []),
+      inputSchema: z.object({ card_id: z.string().optional(), card_last4: z.string().optional() }),
+      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC, card_last4: CARD_LAST4_DESC }, []),
       handler: async (ctx, args) => {
-        const resolved = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id);
+        const resolved = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id, args.card_last4);
         const { card, replacement } = await cards.reportLost(resolved.id);
         return { blocked: true, card: mapCard(card), replacementCard: mapCard(replacement) };
       },
@@ -125,10 +142,10 @@ export function buildCardTools(accounts: AccountsService, cards: CardsService): 
       description:
         "Report the card stolen — immediately blocks it and requests a replacement. Urgent, don't delay. If " +
         'the customer mentions unauthorized use, also consider create_support_case (fraud).',
-      inputSchema: z.object({ card_id: z.string().optional() }),
-      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC }, []),
+      inputSchema: z.object({ card_id: z.string().optional(), card_last4: z.string().optional() }),
+      parametersJsonSchema: toJsonSchema({ card_id: CARD_ID_DESC, card_last4: CARD_LAST4_DESC }, []),
       handler: async (ctx, args) => {
-        const resolved = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id);
+        const resolved = await cards.resolveForCustomer(requireCustomerId(ctx), args.card_id, args.card_last4);
         const { card, replacement } = await cards.reportStolen(resolved.id);
         return { blocked: true, card: mapCard(card), replacementCard: mapCard(replacement) };
       },

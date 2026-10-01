@@ -157,5 +157,32 @@ export class CampaignSchedulerService {
         success: true,
       });
     }
+
+    await this.closeOutFinishedCallbacks();
+  }
+
+  /**
+   * A callback previously moved to SCHEDULED the moment its call was placed — nothing ever
+   * closed the loop afterward, so get_callback_status would keep reporting "scheduled" forever
+   * even after the call actually finished. This is the honest completion signal: the linked
+   * Call's own endTime, set by the same call-handling path regardless of channel — never
+   * inferred from anything this scheduler guesses at itself.
+   */
+  private async closeOutFinishedCallbacks(): Promise<void> {
+    const scheduled = await this.prisma.callback.findMany({
+      where: { status: 'SCHEDULED', call: { endTime: { not: null } } },
+      include: { call: true },
+    });
+    for (const callback of scheduled) {
+      await this.prisma.callback.update({ where: { id: callback.id }, data: { status: 'COMPLETED' } });
+      await this.auditService.log({
+        actorType: AuditActorType.SYSTEM,
+        action: 'callback.completed',
+        entityType: 'callback',
+        entityId: callback.id,
+        result: { callId: callback.callId },
+        success: true,
+      });
+    }
   }
 }

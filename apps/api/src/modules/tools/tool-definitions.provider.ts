@@ -26,6 +26,7 @@ import { buildTransferTools } from './definitions/transfer-tools';
 import { buildVerificationTools } from './definitions/verification-tools';
 import { buildSupportCaseTools } from './definitions/support-case-tools';
 import { buildStatementTools } from './definitions/statement-tools';
+import { buildProfileTools } from './definitions/profile-tools';
 
 export const TOOL_DEFINITIONS = Symbol('TOOL_DEFINITIONS');
 
@@ -63,7 +64,14 @@ function buildCoreToolDefinitions(
           fullName: customer.fullName,
           email: customer.email,
           phone: customer.phone,
+          address: customer.address ?? undefined,
           language: customer.language,
+          // Online-banking login state — distinct from the ACCOUNT's own status (see
+          // get_account_status): a customer can be locked out of logging in while their
+          // account itself is perfectly ACTIVE, or vice versa. Needed to honestly answer
+          // "why can't I log in" / "is my online banking locked" instead of guessing.
+          onlineBankingLocked: customer.onlineBankingLocked,
+          failedLoginAttempts: customer.failedLoginAttempts,
         };
       },
     },
@@ -227,6 +235,48 @@ function buildCoreToolDefinitions(
         };
       },
     },
+    {
+      name: 'get_callback_status',
+      description: "Get the status of a callback request. Omit callback_id to check the customer's most recent one.",
+      inputSchema: z.object({ callback_id: z.string().optional() }),
+      parametersJsonSchema: toJsonSchema(
+        { callback_id: { type: 'string', description: 'Exact callbackId from schedule_callback, if known' } },
+        [],
+      ),
+      idempotent: true,
+      handler: async (ctx, args) => {
+        if (!ctx.customerId) throw new NotFoundException('No customer associated with this conversation');
+        const callback = args.callback_id
+          ? await callbacks.findOneForCustomer(args.callback_id, ctx.customerId)
+          : await callbacks.findMostRecentActiveForCustomer(ctx.customerId);
+        if (!callback) return { found: false };
+        return {
+          found: true,
+          callbackId: callback.id,
+          requestedDate: callback.requestedDate.toISOString().slice(0, 10),
+          requestedTime: callback.requestedTime,
+          status: callback.status,
+        };
+      },
+    },
+    {
+      name: 'cancel_callback',
+      description: "Cancel a previously requested callback, before it's been placed.",
+      inputSchema: z.object({ callback_id: z.string().optional() }),
+      parametersJsonSchema: toJsonSchema(
+        { callback_id: { type: 'string', description: "Exact callbackId, if known — omit to cancel the customer's most recent active one" } },
+        [],
+      ),
+      handler: async (ctx, args) => {
+        if (!ctx.customerId) throw new NotFoundException('No customer associated with this conversation');
+        const target = args.callback_id
+          ? { id: args.callback_id }
+          : await callbacks.findMostRecentActiveForCustomer(ctx.customerId);
+        if (!target) throw new NotFoundException('No active callback to cancel');
+        const cancelled = await callbacks.cancelForCustomer(target.id, ctx.customerId);
+        return { cancelled: true, callbackId: cancelled.id };
+      },
+    },
   ];
 }
 
@@ -258,6 +308,7 @@ function buildToolDefinitions(
     ...buildVerificationTools(verification, prisma),
     ...buildSupportCaseTools(tickets, transactions),
     ...buildStatementTools(accounts, statements),
+    ...buildProfileTools(customers, verification),
   ];
 }
 

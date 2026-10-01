@@ -8,8 +8,40 @@ type DemoTransaction = {
   date: string;
   amount: number;
   currency: string;
-  status: 'COMPLETED' | 'PENDING' | 'FAILED';
+  status: 'COMPLETED' | 'PENDING' | 'FAILED' | 'REVERSED';
   reason?: string;
+  channel?:
+    | 'CARD_PURCHASE'
+    | 'POS'
+    | 'ONLINE'
+    | 'ATM_WITHDRAWAL'
+    | 'ATM_DEPOSIT'
+    | 'TRANSFER'
+    | 'FEE'
+    | 'REFUND'
+    | 'DIRECT_DEBIT'
+    | 'OTHER';
+  merchantName?: string;
+  // Links a REFUND-channel row back to the original charge it refunds — must reference a txn
+  // id that appears EARLIER in the same customer's transaction list (backfilled in order).
+  relatedTransactionRef?: string;
+};
+
+type BeneficiarySeed = {
+  name: string;
+  accountNumber: string;
+  bankName?: string;
+  status?: 'ACTIVE' | 'PENDING_VERIFICATION' | 'BLOCKED' | 'REMOVED';
+};
+
+type TransferSeed = {
+  reference: string;
+  toBeneficiaryIndex: number;
+  amount: number;
+  fee?: number;
+  status: 'COMPLETED' | 'FAILED' | 'CANCELLED';
+  failureReason?: 'INSUFFICIENT_FUNDS' | 'LIMIT_EXCEEDED' | 'OTHER';
+  daysAgo: number;
 };
 
 type AccountOverride = {
@@ -57,9 +89,20 @@ interface DemoCustomer {
   cardOverride?: CardOverride;
   // When set, seeds a second card (PENDING_REPLACEMENT) replacing the primary one.
   replacementCardLast4?: string;
+  // When set, seeds a second, independently ACTIVE card (not a replacement) — the "customer has
+  // more than one usable card" archetype, distinct from replacementCardLast4's stolen/lost flow.
+  secondCardLast4?: string;
   onlineBankingLocked?: boolean;
   failedLoginAttempts?: number;
   supportCase?: SupportCaseSeed;
+  // Additional cases beyond the single `supportCase` above — for archetypes needing more than
+  // one (e.g. a resolved case AND a still-open complaint on the same customer).
+  supportCases?: SupportCaseSeed[];
+  beneficiaries?: BeneficiarySeed[];
+  // Historical, already-resolved transfers (COMPLETED/FAILED/CANCELLED only — never a live
+  // PENDING_CONFIRMATION row, which would imply an executable action still open on some
+  // long-gone conversation). Requires `beneficiaries` above; toBeneficiaryIndex refers to it.
+  transfers?: TransferSeed[];
 }
 
 // Each demo customer sees THEIR OWN data when the AI calls the account/card/transaction
@@ -122,8 +165,25 @@ const DEMO_CUSTOMERS: DemoCustomer[] = [
     },
     extraTransactions: [
       { id: 'TXN-7722', date: '2026-09-07', amount: 210.0, currency: 'SAR', status: 'FAILED', reason: 'Insufficient funds' },
+      // Reversed payment archetype: the charge itself was voided/reversed, not refunded separately.
+      { id: 'TXN-7730', date: '2026-09-04', amount: 175.0, currency: 'SAR', status: 'REVERSED', channel: 'CARD_PURCHASE', merchantName: 'Gulf Office Supplies' },
+      // Duplicate-payment archetype: same merchant/amount, one day apart — needs disambiguation,
+      // never assume which one the customer means.
+      { id: 'TXN-7741', date: '2026-09-05', amount: 320.0, currency: 'SAR', status: 'COMPLETED', channel: 'POS', merchantName: 'Riyadh Wholesale Mart' },
+      { id: 'TXN-7742', date: '2026-09-06', amount: 320.0, currency: 'SAR', status: 'COMPLETED', channel: 'POS', merchantName: 'Riyadh Wholesale Mart' },
     ],
     cardLast4: '5563',
+    // Beneficiary support archetype: one usable, one blocked (e.g. flagged as suspicious).
+    beneficiaries: [
+      { name: 'Al-Rajhi Supplies Est.', accountNumber: 'ACC-90011223', bankName: 'Barq Bank', status: 'ACTIVE' },
+      { name: 'Unverified Vendor Co.', accountNumber: 'ACC-90022998', bankName: 'Barq Bank', status: 'BLOCKED' },
+    ],
+    // Transfer history archetype: one completed (with its beneficiary fee actually charged), one
+    // failed on insufficient funds — covers "pending/failed transfer" and "transfer history".
+    transfers: [
+      { reference: 'TRF-SEED0001', toBeneficiaryIndex: 0, amount: 500, fee: 5, status: 'COMPLETED', daysAgo: 6 },
+      { reference: 'TRF-SEED0002', toBeneficiaryIndex: 0, amount: 2000, status: 'FAILED', failureReason: 'INSUFFICIENT_FUNDS', daysAgo: 2 },
+    ],
   },
   {
     // Archetype C: PIN blocked, online banking locked, suspended account.
@@ -186,6 +246,9 @@ const DEMO_CUSTOMERS: DemoCustomer[] = [
       ],
     },
     cardLast4: '8896',
+    // Multiple independently-active cards archetype: two usable cards, neither a replacement of
+    // the other — "my card isn't working" must be disambiguated, never guessed.
+    secondCardLast4: '8897',
   },
   {
     // Archetype D: lost/stolen card + replacement in progress.
@@ -242,11 +305,160 @@ const DEMO_CUSTOMERS: DemoCustomer[] = [
       disputeAmount: 780.0,
     },
   },
+  {
+    // Archetype F: lost (not stolen) card, plus a resolved/closed case and a still-open
+    // complaint — covers the "resolved/closed ticket" and "complaint" gaps together.
+    fullName: 'Yousef Al-Qahtani',
+    email: 'yousef@example.com',
+    phone: '+966507890123',
+    language: 'en',
+    metadata: {
+      account: { accountNumber: 'ACC-10116784', accountType: 'PERSONAL', status: 'ACTIVE', openedDate: '2024-08-03' },
+      balance: { balance: 1840.0, currency: 'SAR' },
+      transactions: [
+        { id: 'TXN-1120', date: '2026-09-12', amount: 60.0, currency: 'SAR', status: 'COMPLETED' },
+        { id: 'TXN-1108', date: '2026-08-30', amount: 300.0, currency: 'SAR', status: 'COMPLETED' },
+      ],
+    },
+    cardLast4: '9901',
+    cardOverride: {
+      status: 'LOST',
+      lostReportedAt: new Date('2026-09-20T14:00:00Z'),
+      blockReason: 'Reported lost by customer',
+    },
+    replacementCardLast4: '9912',
+    supportCase: {
+      category: 'GENERAL_INQUIRY',
+      subcategory: 'ACCOUNT_LIMITS',
+      description: 'Customer asked about their daily transfer and ATM limits.',
+      status: 'CLOSED',
+      priority: 'LOW',
+    },
+    supportCases: [
+      {
+        category: 'COMPLAINT',
+        subcategory: 'BRANCH_SERVICE',
+        description: 'Customer complained about long wait times at a branch visit.',
+        status: 'WAITING_FOR_CUSTOMER',
+        priority: 'MEDIUM',
+      },
+    ],
+  },
+  {
+    // Archetype G: ATM cash-not-dispensed dispute (still open) + a transaction-dispute case
+    // that's genuinely pending a refund (resolved outcome not yet reached — nothing to
+    // fabricate) — covers the ATM-dispute and pending-refund gaps.
+    fullName: 'Layla Hassan',
+    email: 'layla@example.com',
+    phone: '+966508901234',
+    language: 'en',
+    metadata: {
+      account: { accountNumber: 'ACC-10127895', accountType: 'PERSONAL', status: 'ACTIVE', openedDate: '2024-03-15' },
+      balance: { balance: 2100.0, currency: 'SAR' },
+      transactions: [
+        { id: 'TXN-1310', date: '2026-09-14', amount: 90.0, currency: 'SAR', status: 'COMPLETED' },
+      ],
+    },
+    extraTransactions: [
+      // Account debited, but the ATM never dispensed the cash — the transaction itself is
+      // COMPLETED (money genuinely left the account); only a dispute/case makes this right,
+      // never a claim that it's "already been refunded".
+      { id: 'TXN-1322', date: '2026-09-21', amount: 400.0, currency: 'SAR', status: 'COMPLETED', channel: 'ATM_WITHDRAWAL', merchantName: 'Barq Bank ATM - King Fahd Rd' },
+      // A separate, earlier dispute that already concluded with a real, linked refund —
+      // "was I refunded" must be answerable from this link, never from a resolution note alone.
+      { id: 'TXN-1298', date: '2026-09-01', amount: 260.0, currency: 'SAR', status: 'COMPLETED', channel: 'ONLINE', merchantName: 'Najm Electronics' },
+      { id: 'TXN-1299', date: '2026-09-03', amount: 260.0, currency: 'SAR', status: 'COMPLETED', channel: 'REFUND', merchantName: 'Najm Electronics', relatedTransactionRef: 'TXN-1298' },
+      // ATM matrix (2026-09-29, real-world gap-closing pass) — B: partial cash (full amount
+      // debited, only part physically dispensed — the shortfall is the dispute amount, never a
+      // fabricated auto-refund of the full withdrawal).
+      { id: 'TXN-1410', date: '2026-09-22', amount: 500.0, currency: 'SAR', status: 'COMPLETED', channel: 'ATM_WITHDRAWAL', merchantName: 'Barq Bank ATM - Olaya St' },
+      // C: wrong amount dispensed (dispensed more/less than requested — again the discrepancy,
+      // not the whole transaction, is what's disputed).
+      { id: 'TXN-1420', date: '2026-09-23', amount: 200.0, currency: 'SAR', status: 'COMPLETED', channel: 'ATM_WITHDRAWAL', merchantName: 'Barq Bank ATM - Tahlia St' },
+      // E: still pending — must be reported as PENDING, never narrated as if it already failed
+      // or succeeded.
+      { id: 'TXN-1430', date: '2026-09-24', amount: 100.0, currency: 'SAR', status: 'PENDING', channel: 'ATM_WITHDRAWAL', merchantName: 'Barq Bank ATM - King Fahd Rd' },
+      // F: reversed — the withdrawal itself was voided, distinct from a separately-issued refund.
+      { id: 'TXN-1440', date: '2026-09-25', amount: 150.0, currency: 'SAR', status: 'REVERSED', channel: 'ATM_WITHDRAWAL', merchantName: 'Other Bank ATM - Airport' },
+      // G: customer doesn't recognize this withdrawal at all — a fraud dispute, not a
+      // cash-not-dispensed one.
+      { id: 'TXN-1450', date: '2026-09-26', amount: 600.0, currency: 'SAR', status: 'COMPLETED', channel: 'ATM_WITHDRAWAL', merchantName: 'Unknown ATM - Jeddah' },
+      // H: a real, DB-grounded ATM fee (out-of-network) — "why was I charged this" must be
+      // answerable from this linked row, never a config-only number with nothing behind it.
+      { id: 'TXN-1460', date: '2026-09-26', amount: 300.0, currency: 'SAR', status: 'COMPLETED', channel: 'ATM_WITHDRAWAL', merchantName: 'Other Bank ATM - Jeddah' },
+      { id: 'TXN-1461', date: '2026-09-26', amount: 10.0, currency: 'SAR', status: 'COMPLETED', channel: 'FEE', merchantName: 'Other Bank ATM - Jeddah', relatedTransactionRef: 'TXN-1460', reason: 'ATM withdrawal fee (other network)' },
+      // I: withdrawal limit reached — a real FAILED transaction with a real failure reason, not
+      // an inferred/guessed one.
+      { id: 'TXN-1470', date: '2026-09-27', amount: 5000.0, currency: 'SAR', status: 'FAILED', channel: 'ATM_WITHDRAWAL', merchantName: 'Barq Bank ATM - Olaya St', reason: 'Limit exceeded' },
+    ],
+    cardLast4: '9933',
+    supportCases: [
+      {
+        category: 'TRANSACTION_DISPUTE',
+        subcategory: 'ATM_CASH_NOT_DISPENSED',
+        description: 'Customer states the ATM debited their account but did not dispense any cash.',
+        status: 'IN_PROGRESS',
+        priority: 'HIGH',
+        linkTransactionRef: 'TXN-1322',
+        disputeAmount: 400.0,
+      },
+      {
+        category: 'TRANSACTION_DISPUTE',
+        subcategory: 'DUPLICATE_CHARGE',
+        description: 'Customer was charged twice for the same online order; refund requested for the duplicate.',
+        status: 'OPEN',
+        priority: 'MEDIUM',
+        linkTransactionRef: 'TXN-1298',
+        disputeAmount: 260.0,
+      },
+      {
+        category: 'TRANSACTION_DISPUTE',
+        subcategory: 'ATM_PARTIAL_CASH',
+        description: 'Customer requested 500 SAR but the ATM only dispensed 300 SAR; the full 500 was debited.',
+        status: 'OPEN',
+        priority: 'HIGH',
+        linkTransactionRef: 'TXN-1410',
+        disputeAmount: 200.0,
+      },
+      {
+        category: 'TRANSACTION_DISPUTE',
+        subcategory: 'ATM_WRONG_AMOUNT',
+        description: 'Customer requested 200 SAR but the ATM dispensed only 150 SAR.',
+        status: 'OPEN',
+        priority: 'MEDIUM',
+        linkTransactionRef: 'TXN-1420',
+        disputeAmount: 50.0,
+      },
+      {
+        category: 'FRAUD_DISPUTE',
+        subcategory: 'UNRECOGNIZED_ATM_WITHDRAWAL',
+        description: 'Customer does not recognize this ATM withdrawal at all and suspects unauthorized use.',
+        status: 'ESCALATED',
+        priority: 'URGENT',
+        linkTransactionRef: 'TXN-1450',
+        disputeAmount: 600.0,
+      },
+      // D: card retained by the ATM machine itself — deliberately NOT flipped to a card status
+      // here (this system has no real branch/courier process to recover a machine-retained
+      // card, and inventing a status transition with no real recovery workflow behind it would
+      // be exactly the "represent it honestly as a support case" principle this section asks
+      // for, not a fabricated capability).
+      {
+        category: 'CARD_ISSUE',
+        subcategory: 'RETAINED_BY_ATM',
+        description: 'The ATM retained the customer\'s card during a withdrawal attempt.',
+        status: 'OPEN',
+        priority: 'HIGH',
+        linkCard: true,
+      },
+    ],
+  },
 ];
 
 const DEFAULT_AGENT_TOOLS = [
   // Generic support
   'get_customer',
+  'update_contact_info',
   'create_ticket',
   'get_ticket',
   'update_ticket',
@@ -254,6 +466,8 @@ const DEFAULT_AGENT_TOOLS = [
   'transfer_to_human',
   'end_call',
   'schedule_callback',
+  'get_callback_status',
+  'cancel_callback',
   // Account
   'get_account',
   'get_balance',
@@ -290,6 +504,7 @@ const DEFAULT_AGENT_TOOLS = [
   'remove_beneficiary',
   // Transfers
   'get_transfer_limits',
+  'get_transfer',
   'create_transfer',
   'confirm_transfer',
   'cancel_transfer',
@@ -297,6 +512,7 @@ const DEFAULT_AGENT_TOOLS = [
   'create_support_case',
   'get_support_case',
   'get_customer_cases',
+  'add_case_information',
   // Statements
   'request_statement',
   'get_statement',
@@ -326,6 +542,8 @@ function mapFailureReason(reason?: string) {
       return 'CARD_EXPIRED' as const;
     case 'Account suspended':
       return 'ACCOUNT_SUSPENDED' as const;
+    case 'Limit exceeded':
+      return 'LIMIT_EXCEEDED' as const;
     default:
       return reason ? ('OTHER' as const) : null;
   }
@@ -371,6 +589,43 @@ async function upsertCard(
     return prisma.card.update({ where: { id: existing.id }, data: fields });
   }
   return prisma.card.create({ data: { accountId, cardNumberMasked, ...fields } });
+}
+
+/**
+ * index 0 keeps the original `CASE-{accountNumber}` ticket number (backward compatible with
+ * every already-seeded single-case customer); additional cases from `supportCases` get an
+ * index suffix, so a customer can have more than one without a naming collision.
+ */
+async function upsertSupportCase(params: {
+  customerId: string;
+  accountNumber: string;
+  index: number;
+  accountId: string;
+  primaryCardId: string;
+  sc: SupportCaseSeed;
+}) {
+  const ticketNumber = params.index === 0 ? `CASE-${params.accountNumber}` : `CASE-${params.accountNumber}-${params.index}`;
+  const linkedTransaction = params.sc.linkTransactionRef
+    ? await prisma.transaction.findUnique({ where: { transactionRef: params.sc.linkTransactionRef } })
+    : null;
+  const ticketData = {
+    customerId: params.customerId,
+    category: params.sc.category,
+    subcategory: params.sc.subcategory ?? null,
+    description: params.sc.description,
+    status: params.sc.status ?? 'OPEN',
+    priority: params.sc.priority ?? 'MEDIUM',
+    accountId: params.accountId,
+    cardId: params.sc.linkCard ? params.primaryCardId : null,
+    transactionId: linkedTransaction?.id ?? null,
+    disputeAmount: params.sc.disputeAmount ?? null,
+  };
+  const existingTicket = await prisma.ticket.findUnique({ where: { ticketNumber } });
+  if (existingTicket) {
+    await prisma.ticket.update({ where: { id: existingTicket.id }, data: ticketData });
+  } else {
+    await prisma.ticket.create({ data: { ticketNumber, ...ticketData } });
+  }
 }
 
 async function main() {
@@ -463,28 +718,45 @@ async function main() {
       },
     });
 
+    // Order matters: a REFUND row's relatedTransactionRef must name a txn listed EARLIER in
+    // this same array, since each is upserted in sequence and the lookup below only finds
+    // whatever already exists.
     const allTransactions = [...demo.metadata.transactions, ...(demo.extraTransactions ?? [])];
     for (const txn of allTransactions) {
+      const relatedTransaction = txn.relatedTransactionRef
+        ? await prisma.transaction.findUnique({ where: { transactionRef: txn.relatedTransactionRef } })
+        : null;
+      const type = txn.channel === 'REFUND' || txn.channel === 'ATM_DEPOSIT' ? 'CREDIT' : 'DEBIT';
+      // `reason` doubles as the seed's plain-English `description` for ANY status, but only
+      // means a real `failureReason` when the transaction actually FAILED — a completed fee/
+      // ATM transaction using `reason` just for a human-readable description must never pick up
+      // a stray OTHER failure reason it never had (2026-09-29, caught live: a completed fee
+      // transaction with a descriptive `reason` was narrated as "an unspecified issue").
+      const failureReason = txn.status === 'FAILED' ? mapFailureReason(txn.reason) : null;
       await prisma.transaction.upsert({
         where: { transactionRef: txn.id },
         create: {
           transactionRef: txn.id,
           accountId: account.id,
-          type: 'DEBIT',
-          channel: 'OTHER',
+          type,
+          channel: txn.channel ?? 'OTHER',
           amount: txn.amount,
           currency: txn.currency,
           status: txn.status,
-          failureReason: mapFailureReason(txn.reason),
+          failureReason,
           description: txn.reason ?? null,
+          merchantName: txn.merchantName ?? null,
+          relatedTransactionId: relatedTransaction?.id ?? null,
           postedAt: new Date(txn.date),
         },
         update: {
           amount: txn.amount,
           currency: txn.currency,
           status: txn.status,
-          failureReason: mapFailureReason(txn.reason),
+          failureReason,
           description: txn.reason ?? null,
+          merchantName: txn.merchantName ?? null,
+          relatedTransactionId: relatedTransaction?.id ?? null,
         },
       });
     }
@@ -508,30 +780,120 @@ async function main() {
         replacesCardId: primaryCard.id,
       });
     }
+    if (demo.secondCardLast4) {
+      await upsertCard(account.id, maskedCardNumber(demo.secondCardLast4), { status: 'ACTIVE' });
+    }
 
-    if (demo.supportCase) {
-      const sc = demo.supportCase;
-      const ticketNumber = `CASE-${legacyAccount.accountNumber}`;
-      const linkedTransaction = sc.linkTransactionRef
-        ? await prisma.transaction.findUnique({ where: { transactionRef: sc.linkTransactionRef } })
-        : null;
-      const existingTicket = await prisma.ticket.findUnique({ where: { ticketNumber } });
-      const ticketData = {
+    const allCases = [demo.supportCase, ...(demo.supportCases ?? [])].filter(
+      (sc): sc is SupportCaseSeed => Boolean(sc),
+    );
+    for (let i = 0; i < allCases.length; i++) {
+      await upsertSupportCase({
         customerId,
-        category: sc.category,
-        subcategory: sc.subcategory ?? null,
-        description: sc.description,
-        status: sc.status ?? 'OPEN',
-        priority: sc.priority ?? 'MEDIUM',
+        accountNumber: legacyAccount.accountNumber,
+        index: i,
         accountId: account.id,
-        cardId: sc.linkCard ? primaryCard.id : null,
-        transactionId: linkedTransaction?.id ?? null,
-        disputeAmount: sc.disputeAmount ?? null,
-      };
-      if (existingTicket) {
-        await prisma.ticket.update({ where: { id: existingTicket.id }, data: ticketData });
-      } else {
-        await prisma.ticket.create({ data: { ticketNumber, ...ticketData } });
+        primaryCardId: primaryCard.id,
+        sc: allCases[i],
+      });
+    }
+
+    const beneficiaryRecords = [];
+    for (const b of demo.beneficiaries ?? []) {
+      const record = await prisma.beneficiary.upsert({
+        where: { customerId_accountNumber: { customerId, accountNumber: b.accountNumber } },
+        create: {
+          customerId,
+          beneficiaryName: b.name,
+          accountNumber: b.accountNumber,
+          bankName: b.bankName ?? 'Barq Bank',
+          status: b.status ?? 'ACTIVE',
+        },
+        update: { beneficiaryName: b.name, bankName: b.bankName ?? 'Barq Bank', status: b.status ?? 'ACTIVE' },
+      });
+      beneficiaryRecords.push(record);
+    }
+
+    if (demo.transfers?.length) {
+      // Any conversation belonging to this customer will do — these are historical,
+      // already-resolved transfers, not a live pending action tied to a real chat turn.
+      let conversation = await prisma.conversation.findFirst({ where: { customerId }, orderBy: { createdAt: 'asc' } });
+      if (!conversation) {
+        conversation = await prisma.conversation.create({ data: { customerId, channel: 'TEXT', state: 'CALL_ENDED' } });
+      }
+
+      for (const t of demo.transfers) {
+        const beneficiary = beneficiaryRecords[t.toBeneficiaryIndex];
+        if (!beneficiary) continue;
+        const occurredAt = new Date(Date.now() - t.daysAgo * 24 * 60 * 60 * 1000);
+
+        let resultingTransactionId: string | null = null;
+        if (t.status === 'COMPLETED') {
+          const debitTxn = await prisma.transaction.upsert({
+            where: { transactionRef: `${t.reference}-DR` },
+            create: {
+              transactionRef: `${t.reference}-DR`,
+              accountId: account.id,
+              type: 'DEBIT',
+              channel: 'TRANSFER',
+              amount: t.amount,
+              currency: 'SAR',
+              status: 'COMPLETED',
+              description: `Transfer to ${beneficiary.beneficiaryName}`,
+              postedAt: occurredAt,
+              settledAt: occurredAt,
+            },
+            update: {},
+          });
+          resultingTransactionId = debitTxn.id;
+
+          if (t.fee) {
+            await prisma.transaction.upsert({
+              where: { transactionRef: `${t.reference}-FEE` },
+              create: {
+                transactionRef: `${t.reference}-FEE`,
+                accountId: account.id,
+                type: 'DEBIT',
+                channel: 'FEE',
+                amount: t.fee,
+                currency: 'SAR',
+                status: 'COMPLETED',
+                description: 'Beneficiary transfer fee',
+                relatedTransactionId: debitTxn.id,
+                postedAt: occurredAt,
+                settledAt: occurredAt,
+              },
+              update: {},
+            });
+          }
+        }
+
+        await prisma.transfer.upsert({
+          where: { transferReference: t.reference },
+          create: {
+            transferReference: t.reference,
+            customerId,
+            conversationId: conversation.id,
+            fromAccountId: account.id,
+            beneficiaryId: beneficiary.id,
+            type: 'BENEFICIARY',
+            amount: t.amount,
+            fee: t.fee ?? 0,
+            currency: 'SAR',
+            status: t.status,
+            failureReason: t.failureReason ?? null,
+            resultingTransactionId,
+            confirmationExpiresAt: occurredAt,
+            confirmedAt: occurredAt,
+            executedAt: t.status === 'COMPLETED' ? occurredAt : null,
+            createdAt: occurredAt,
+          },
+          update: {
+            status: t.status,
+            failureReason: t.failureReason ?? null,
+            resultingTransactionId,
+          },
+        });
       }
     }
   }
@@ -588,7 +950,15 @@ async function main() {
     'send_statement_by_email itself reports success; if it reports no registered email is on file, say so ' +
     'plainly rather than inventing one; if it reports any other failure, apologize and say you were not able to ' +
     'send it right now — never claim it was sent when it was not. This system still has no SMS delivery — never ' +
-    'say you have texted a statement or any document.';
+    'say you have texted a statement or any document. ' +
+    'Contact info changes (phone, email, mailing address): this needs the customer to be VERIFIED first, same ' +
+    'as any other sensitive change. If update_contact_info fails because they are not yet verified, call ' +
+    'start_verification and ask them to read back the code; once they give a code, that IS the verification ' +
+    'code — treat it as such and let the system confirm it, do not ask again or assume it worked yourself. ' +
+    'Only after verification is confirmed, call update_contact_info with EXACTLY the new value the customer ' +
+    'just stated — copy it character-for-character, never paraphrase, reformat, or invent a different number ' +
+    'or address. Only tell the customer it was updated if update_contact_info itself reports success this turn ' +
+    '— never say a phone/email/address change is "in effect" or "reflected in our records" ahead of that.';
 
   const existingAgent = await prisma.aiAgent.findFirst({
     where: { name: 'General Support Agent' },

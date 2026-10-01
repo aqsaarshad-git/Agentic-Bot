@@ -7,6 +7,7 @@ type MockPrisma = {
     findMany: jest.Mock;
     create: jest.Mock;
     update: jest.Mock;
+    updateMany: jest.Mock;
   };
   customer: { findUnique: jest.Mock };
   call: { findUnique: jest.Mock };
@@ -52,6 +53,7 @@ describe('VerificationService', () => {
         findMany: jest.fn().mockResolvedValue([]),
         create: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
       customer: { findUnique: jest.fn().mockResolvedValue({ id: 'cust-1', email: 'a@b.com' }) },
       // Defaults to "no Call row" (i.e. not a PSTN conversation) so every existing test below
@@ -210,6 +212,23 @@ describe('VerificationService', () => {
       const { session } = await service.createSession({ customerId: 'cust-1', purpose: 'IDENTITY' });
       expect(session.id).toBe('session-new');
       expect(prisma.verificationSession.create).toHaveBeenCalled();
+    });
+
+    // CONFIRMED LIVE (finding #7, gap-closing round 3): update_contact_info called TWICE
+    // pre-verification (customer states a phone number, then changes their mind before entering
+    // any code) left the FIRST session's own real code still able to verify and re-apply the
+    // abandoned value later — "verify always picks the most recent session" only helps until the
+    // most recent one is consumed; the older one was still sitting there, completable, the whole
+    // time. createSession must retire it the moment a newer one for the same
+    // customer/conversation/purpose is created, not leave that to verify-time ordering alone.
+    it('supersedes an existing in-progress session for the same customer/conversation/purpose', async () => {
+      prisma.verificationSession.findFirst.mockResolvedValueOnce(null); // no active lockout
+      prisma.verificationSession.create.mockResolvedValue(makeSession({ id: 'session-new', targetRef: '{"phone":"+2"}' }));
+      await service.createSession({ customerId: 'cust-1', conversationId: 'conv-1', purpose: 'IDENTITY', targetRef: '{"phone":"+2"}' });
+      expect(prisma.verificationSession.updateMany).toHaveBeenCalledWith({
+        where: { customerId: 'cust-1', conversationId: 'conv-1', purpose: 'IDENTITY', status: 'VERIFICATION_IN_PROGRESS' },
+        data: { status: 'SUPERSEDED' },
+      });
     });
   });
 });

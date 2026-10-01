@@ -135,6 +135,18 @@ export class VerificationService {
       throw new BadRequestException('Customer not found');
     }
 
+    // CONFIRMED LIVE (finding #7, gap-closing round 3): a customer who supplies a value, then
+    // supplies a DIFFERENT value before ever entering a code (update_contact_info called twice
+    // pre-verification) left the FIRST session sitting there, still VERIFICATION_IN_PROGRESS and
+    // still completable by its own real code — a later correct entry of that first, stale code
+    // would silently re-apply the abandoned value, overwriting the customer's actual latest
+    // intent. Superseding here (not just "the most recent session wins" at verify-time) is what
+    // makes the earlier code stop working at all, not just stop being the one picked by default.
+    await this.prisma.verificationSession.updateMany({
+      where: { customerId, conversationId, purpose, status: 'VERIFICATION_IN_PROGRESS' },
+      data: { status: 'SUPERSEDED' },
+    });
+
     const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
     const codeHash = await bcrypt.hash(code, 10);
 

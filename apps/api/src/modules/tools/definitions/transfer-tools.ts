@@ -96,12 +96,19 @@ export function buildTransferTools(
           verificationSessionId: identitySession?.id,
         });
         const destinationAccountNumber = toAccount?.accountNumber ?? beneficiary?.accountNumber ?? '';
+        const fee = Number(transfer.fee);
         return {
           transferReference: transfer.transferReference,
           sourceAccountLast4: fromAccount.accountNumber.slice(-4),
           destinationLast4: destinationAccountNumber.slice(-4),
           destinationName: beneficiary?.beneficiaryName,
           amount: Number(transfer.amount),
+          // Always state the fee up front, even when it's 0 — a transfer must never be
+          // confirmed by the customer without knowing the total that will actually leave their
+          // account, and silently adding one only at execution time would be exactly the kind
+          // of hidden charge this system's anti-fabrication guarantees exist to prevent.
+          fee,
+          totalDebit: Number(transfer.amount) + fee,
           currency: transfer.currency,
           expiresInMinutes: 5,
           requiresConfirmation: true,
@@ -120,14 +127,45 @@ export function buildTransferTools(
       handler: async (ctx) => {
         const customerId = requireCustomerId(ctx);
         const conversationId = requireConversationId(ctx);
-        const { transferReference, transaction } = await transfers.confirmAndExecute(customerId, conversationId);
+        const { transferReference, fee, transaction } = await transfers.confirmAndExecute(customerId, conversationId);
         return {
           transferReference,
           status: 'COMPLETED',
           amount: Number(transaction.amount),
+          fee,
+          totalDebit: Number(transaction.amount) + fee,
           currency: transaction.currency,
           providerReference: transaction.transactionRef,
           executedAt: transaction.settledAt,
+        };
+      },
+    },
+    {
+      name: 'get_transfer',
+      description:
+        "Look up a specific past transfer by its reference (e.g. TRF-ABC123) — status, amount, who it went to, " +
+        'when, and why it failed if it did. Use this for "what happened to transfer X" questions.',
+      inputSchema: z.object({ transfer_reference: z.string() }),
+      parametersJsonSchema: toJsonSchema(
+        { transfer_reference: { type: 'string', description: 'The transfer reference, e.g. TRF-ABC123' } },
+        ['transfer_reference'],
+      ),
+      idempotent: true,
+      handler: async (ctx, args) => {
+        const customerId = requireCustomerId(ctx);
+        const transfer = await transfers.findByReferenceForCustomer(args.transfer_reference, customerId);
+        return {
+          transferReference: transfer.transferReference,
+          status: transfer.status,
+          amount: Number(transfer.amount),
+          fee: Number(transfer.fee),
+          currency: transfer.currency,
+          createdDate: transfer.createdAt.toISOString().slice(0, 10),
+          destinationName: transfer.beneficiary?.beneficiaryName,
+          destinationAccountLast4: (transfer.toAccount?.accountNumber ?? transfer.beneficiary?.accountNumber)?.slice(-4),
+          failureReason: transfer.failureReason ?? undefined,
+          executedDate: transfer.executedAt?.toISOString().slice(0, 10),
+          resultingTransactionRef: transfer.resultingTransaction?.transactionRef,
         };
       },
     },

@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
 import { TransactionsService } from '../transactions/transactions.service';
 
@@ -9,7 +10,19 @@ export class TransfersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly transactions: TransactionsService,
+    private readonly config: ConfigService,
   ) {}
+
+  /**
+   * The only fee this system currently charges an AI-triggerable transfer: a flat fee for
+   * sending to a saved beneficiary (banking.fees.beneficiaryTransfer in config — already the
+   * documented policy get_fees quotes; this is what actually applies it). Internal
+   * account-to-account transfers stay free, matching that same config entry.
+   */
+  private beneficiaryTransferFee(type: 'INTERNAL' | 'BENEFICIARY'): number {
+    if (type !== 'BENEFICIARY') return 0;
+    return Number(this.config.get('banking.fees.beneficiaryTransfer.amount') ?? 0);
+  }
 
   findAllForCustomer(customerId: string, take = 20) {
     return this.prisma.transfer.findMany({ where: { customerId }, orderBy: { createdAt: 'desc' }, take });
@@ -19,6 +32,19 @@ export class TransfersService {
     const transfer = await this.prisma.transfer.findUnique({ where: { id } });
     if (!transfer || transfer.customerId !== customerId) {
       throw new NotFoundException(`Transfer ${id} not found`);
+    }
+    return transfer;
+  }
+
+  /** Ownership-checked lookup by the human-facing reference (e.g. "TRF-ABC123"), not the
+   *  internal cuid — the tool layer's only entry point for "what's the status of transfer X". */
+  async findByReferenceForCustomer(transferReference: string, customerId: string) {
+    const transfer = await this.prisma.transfer.findUnique({
+      where: { transferReference },
+      include: { beneficiary: true, toAccount: true, resultingTransaction: true },
+    });
+    if (!transfer || transfer.customerId !== customerId) {
+      throw new NotFoundException(`Transfer ${transferReference} not found`);
     }
     return transfer;
   }
@@ -76,10 +102,18 @@ export class TransfersService {
       }
     }
 
-    if (params.amount > Number(fromAccount.availableBalance)) {
-      throw new BadRequestException('Insufficient available balance for this transfer');
+    const type: 'INTERNAL' | 'BENEFICIARY' = toAccount ? 'INTERNAL' : 'BENEFICIARY';
+    const fee = this.beneficiaryTransferFee(type);
+    const totalDebit = params.amount + fee;
+
+    if (totalDebit > Number(fromAccount.availableBalance)) {
+      throw new BadRequestException(
+        fee > 0
+          ? `Insufficient available balance for this transfer plus its ${fee} ${fromAccount.currency} fee`
+          : 'Insufficient available balance for this transfer',
+      );
     }
-    if (params.amount > Number(fromAccount.dailyTransferLimit)) {
+    if (totalDebit > Number(fromAccount.dailyTransferLimit)) {
       throw new BadRequestException(
         `This transfer exceeds your daily transfer limit of ${Number(fromAccount.dailyTransferLimit)} ${fromAccount.currency}`,
       );
@@ -99,8 +133,9 @@ export class TransfersService {
           fromAccountId: fromAccount.id,
           toAccountId: toAccount?.id,
           beneficiaryId: beneficiary?.id,
-          type: toAccount ? 'INTERNAL' : 'BENEFICIARY',
+          type,
           amount: params.amount,
+          fee,
           currency: fromAccount.currency,
           reason: params.reason,
           confirmationExpiresAt: new Date(Date.now() + CONFIRMATION_TTL_MS),
@@ -144,8 +179,10 @@ export class TransfersService {
     }
 
     const amount = Number(pending.amount);
+    const fee = Number(pending.fee);
+    const totalDebit = amount + fee;
     const fromAccount = await this.prisma.account.findUniqueOrThrow({ where: { id: pending.fromAccountId } });
-    if (amount > Number(fromAccount.availableBalance) || amount > Number(fromAccount.dailyTransferLimit)) {
+    if (totalDebit > Number(fromAccount.availableBalance) || totalDebit > Number(fromAccount.dailyTransferLimit)) {
       await this.prisma.transfer.update({
         where: { id: pending.id },
         data: { status: 'FAILED', failureReason: 'INSUFFICIENT_FUNDS' },
@@ -156,7 +193,7 @@ export class TransfersService {
     const transaction = await this.prisma.$transaction(async (prismaTx) => {
       await prismaTx.account.update({
         where: { id: pending.fromAccountId },
-        data: { balance: { decrement: amount }, availableBalance: { decrement: amount } },
+        data: { balance: { decrement: totalDebit }, availableBalance: { decrement: totalDebit } },
       });
       if (pending.toAccountId) {
         await prismaTx.account.update({
@@ -177,6 +214,22 @@ export class TransfersService {
           settledAt: new Date(),
         },
       });
+      if (fee > 0) {
+        await prismaTx.transaction.create({
+          data: {
+            transactionRef: this.transactions.generateTransactionRef(),
+            accountId: pending.fromAccountId,
+            type: 'DEBIT',
+            channel: 'FEE',
+            amount: fee,
+            currency: pending.currency,
+            status: 'COMPLETED',
+            description: 'Beneficiary transfer fee',
+            relatedTransactionId: txn.id,
+            settledAt: new Date(),
+          },
+        });
+      }
       await prismaTx.transfer.update({
         where: { id: pending.id },
         data: {
@@ -189,7 +242,7 @@ export class TransfersService {
       return txn;
     });
 
-    return { transferReference: pending.transferReference, transaction };
+    return { transferReference: pending.transferReference, fee, transaction };
   }
 
   async cancelPending(customerId: string, conversationId: string) {

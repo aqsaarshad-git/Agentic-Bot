@@ -9,6 +9,7 @@ import { TicketsService } from './tickets.service';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { UpdateTicketDto } from './dto/update-ticket.dto';
 import { CreateTicketMessageDto } from './dto/create-ticket-message.dto';
+import { RefundTicketDto } from './dto/refund-ticket.dto';
 
 @Controller('tickets')
 @UseGuards(RolesGuard)
@@ -56,5 +57,12 @@ export class TicketsController {
     @Body() dto: CreateTicketMessageDto,
   ) {
     return this.ticketsService.addMessage(id, 'AGENT', dto.content, actor.sub);
+  }
+
+  /** Issues a real, DB-backed refund against this case's linked transaction — never just a resolution note. */
+  @Post(':id/refund')
+  @Audit('ticket.refund')
+  refund(@Param('id') id: string, @Body() dto: RefundTicketDto) {
+    return this.ticketsService.refund(id, dto);
   }
 }

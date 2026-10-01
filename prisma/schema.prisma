@@ -79,6 +79,7 @@ model Customer {
   fullName    String   @map("full_name")
   email       String?
   phone       String?
+  address     String?
   language    String   @default("ar")
   metadata    Json?
   createdAt   DateTime @default(now()) @map("created_at")
@@ -788,20 +789,29 @@ model Transaction {
   failureReason  TransactionFailureReason? @map("failure_reason")
   description    String?
   merchantName   String?                   @map("merchant_name")
+  // Links a REFUND (or reversal) transaction back to the original charge it corresponds to —
+  // the piece that was previously missing to answer "was I refunded for that duplicate/disputed
+  // charge" from real data instead of trusting a ticket's free-text resolution note. Nullable
+  // and self-referential; a transaction is never its own related transaction, and most
+  // transactions have none at all.
+  relatedTransactionId String?                @map("related_transaction_id")
   postedAt       DateTime                  @default(now()) @map("posted_at")
   settledAt      DateTime?                 @map("settled_at")
   createdAt      DateTime                  @default(now()) @map("created_at")
   updatedAt      DateTime                  @updatedAt @map("updated_at")
 
-  account        Account   @relation(fields: [accountId], references: [id])
-  card           Card?     @relation(fields: [cardId], references: [id])
-  transferResult Transfer?
-  disputeTickets Ticket[]
+  account          Account       @relation(fields: [accountId], references: [id])
+  card             Card?         @relation(fields: [cardId], references: [id])
+  transferResult   Transfer?
+  disputeTickets   Ticket[]
+  relatedTransaction Transaction?  @relation("TransactionRefund", fields: [relatedTransactionId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  refunds          Transaction[] @relation("TransactionRefund")
 
   @@index([accountId])
   @@index([accountId, postedAt])
   @@index([status])
   @@index([cardId])
+  @@index([relatedTransactionId])
   @@map("transactions")
 }
 
@@ -912,6 +922,10 @@ model Transfer {
   beneficiaryId          String?                   @map("beneficiary_id")
   type                   TransferType
   amount                 Decimal                   @db.Decimal(18, 2)
+  // Locked in at propose time from the config-driven fee schedule (banking.fees.beneficiaryTransfer)
+  // so the amount shown to the customer before confirming is exactly what's charged at confirm
+  // time — never recomputed from config again later, which could otherwise drift mid-conversation.
+  fee                    Decimal                   @default(0) @db.Decimal(18, 2)
   currency               String                    @default("SAR")
   reason                 String?
   status                 TransferStatus            @default(PENDING_CONFIRMATION)
@@ -1003,6 +1017,13 @@ enum VerificationStatus {
   VERIFIED
   VERIFICATION_FAILED
   LOCKED
+  // A still-in-progress session for the same customer/conversation/purpose that got replaced by a
+  // newer one before it was ever verified (finding #7, gap-closing round 3) — e.g. the customer
+  // gave a phone number, then changed their mind and gave a different one before entering any
+  // code. Deliberately distinct from VERIFICATION_FAILED: it must never count toward the 3-strike
+  // lockout (nothing was actually attempted and failed on this session), and it must never again
+  // be completable by an old OTP code, which VERIFICATION_IN_PROGRESS alone would still allow.
+  SUPERSEDED
 }
 
 model VerificationSession {

@@ -44,6 +44,25 @@ export class CustomersService {
     return this.prisma.customer.update({ where: { id }, data: dto });
   }
 
+  /**
+   * The ONLY customer-facing (AI-tool) path for changing profile data — deliberately narrower
+   * than the staff-facing `update()` above (which also allows fullName/language): a compromised
+   * or manipulated conversation must never be able to rename the customer or reassign their
+   * account's declared language, only the contact details this tool exists for. Requires at
+   * least one field — an empty call is a caller bug, not a valid "change nothing" request.
+   */
+  async updateContactInfo(id: string, changes: { phone?: string; email?: string; address?: string }) {
+    await this.findOne(id);
+    return this.prisma.customer.update({
+      where: { id },
+      data: {
+        phone: changes.phone,
+        email: changes.email,
+        address: changes.address,
+      },
+    });
+  }
+
   async history(id: string) {
     await this.findOne(id);
     const [conversations, tickets, calls] = await Promise.all([

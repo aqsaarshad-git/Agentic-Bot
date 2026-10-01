@@ -36,8 +36,12 @@ export class CardsService {
    * mode: asked to act on "the" card, it would sometimes invent a plausible-looking ID instead
    * of copying the real one from a prior get_cards result. With only one card on file (the
    * overwhelmingly common case), there is nothing left to get wrong.
+   *
+   * `last4` (2026-09-29, reference-resolution pass): resolves "the card ending in 7712" from
+   * REAL backend data — the masked number itself — never from anything Qwen could invent. Still
+   * throws BadRequestException (ask which one) on 0 or 2+ matches; never guesses.
    */
-  async resolveForCustomer(customerId: string, cardId?: string) {
+  async resolveForCustomer(customerId: string, cardId?: string, last4?: string) {
     if (cardId) {
       return this.findOneForCustomer(cardId, customerId);
     }
@@ -47,6 +51,14 @@ export class CardsService {
     });
     if (cards.length === 0) {
       throw new NotFoundException('No card on file for this customer');
+    }
+    if (last4) {
+      const matches = cards.filter((c) => c.cardNumberMasked.endsWith(last4));
+      if (matches.length === 1) return matches[0];
+      if (matches.length > 1) {
+        throw new BadRequestException(`More than one card ends in ${last4} — ask which one, or call get_cards to list them`);
+      }
+      throw new NotFoundException(`No card ending in ${last4} found on this account`);
     }
     if (cards.length > 1) {
       throw new BadRequestException('The customer has more than one card — ask which one, or call get_cards to list them and use its cardId');
@@ -87,9 +99,43 @@ export class CardsService {
     });
   }
 
-  /** Blocks the card and creates a PENDING_REPLACEMENT sibling in one transaction. */
+  /**
+   * The real invariant `replacesCardId`'s unique constraint enforces: at most one replacement
+   * per original card, ever — regardless of which of the three methods below created it. Every
+   * creation path must check this FIRST, not just "is the status already LOST/STOLEN" (a card
+   * replaced via the plain `replace()` path — e.g. reported damaged — keeps its ACTIVE status,
+   * so that check alone misses it and still crashes on a later reportLost/reportStolen call).
+   */
+  private findExistingReplacement(cardId: string) {
+    return this.prisma.card.findUnique({ where: { replacesCardId: cardId } });
+  }
+
+  /**
+   * Blocks the card and creates a PENDING_REPLACEMENT sibling in one transaction.
+   *
+   * CONFIRMED LIVE (2026-09-29): calling this twice for the same card (a retried/duplicate
+   * report_lost_card or report_stolen_card call — or a report_stolen_card after an earlier
+   * replace_card/report_lost_card on the same card) used to throw a raw, unhandled unique-
+   * constraint error on `replacesCardId` — Prisma has no partial-unique-index equivalent, so
+   * the second `card.create` collided with the first replacement it already made. Idempotent
+   * fix: if a replacement already exists for this card (from ANY of the three methods), return
+   * it instead of attempting to create a second one — still updating the original card's
+   * status/reason if this report is more specific than whatever state it was already in (e.g.
+   * "actually it was stolen" after an earlier plain damage-replacement request).
+   */
   private async reportAndReplace(cardId: string, status: 'LOST' | 'STOLEN', reportedAtField: 'lostReportedAt' | 'stolenReportedAt') {
     const card = await this.findOne(cardId);
+    const existingReplacement = await this.findExistingReplacement(cardId);
+    if (existingReplacement) {
+      const updated =
+        card.status === status
+          ? card
+          : await this.prisma.card.update({
+              where: { id: cardId },
+              data: { status, blockedAt: card.blockedAt ?? new Date(), blockReason: `Reported ${status.toLowerCase()} by customer`, [reportedAtField]: new Date() },
+            });
+      return { card: updated, replacement: existingReplacement };
+    }
     const [updated, replacement] = await this.prisma.$transaction([
       this.prisma.card.update({
         where: { id: cardId },
@@ -126,6 +172,13 @@ export class CardsService {
   /** Standalone replacement request for a card that isn't lost/stolen (e.g. expired, damaged). */
   async replace(cardId: string, reason?: string) {
     const card = await this.findOne(cardId);
+    const existingReplacement = await this.findExistingReplacement(cardId);
+    if (existingReplacement) {
+      if (reason && reason !== card.blockReason) {
+        await this.prisma.card.update({ where: { id: cardId }, data: { blockReason: reason } });
+      }
+      return existingReplacement;
+    }
     return this.prisma.$transaction([
       this.prisma.card.update({
         where: { id: cardId },

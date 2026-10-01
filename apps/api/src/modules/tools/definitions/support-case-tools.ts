@@ -75,20 +75,76 @@ export function buildSupportCaseTools(tickets: TicketsService, transactions: Tra
           status: kase.status,
           priority: kase.priority,
           resolution: kase.resolution ?? undefined,
+          disputeAmount: kase.disputeAmount ? Number(kase.disputeAmount) : undefined,
+          transactionRef: kase.transaction?.transactionRef,
+          cardNumberMasked: kase.card?.cardNumberMasked,
         };
       },
     },
     {
       name: 'get_customer_cases',
-      description: "List the customer's recent support cases.",
-      inputSchema: z.object({ limit: z.number().int().min(1).max(20).optional() }),
-      parametersJsonSchema: toJsonSchema({ limit: { type: 'number', description: 'Max number to return (default 10)' } }, []),
+      description:
+        "List the customer's recent support cases. Filter by transaction_ref or card_id to check whether a " +
+        'dispute/case already exists for a specific transaction or card, before creating a duplicate one.',
+      inputSchema: z.object({
+        limit: z.number().int().min(1).max(20).optional(),
+        transaction_ref: z.string().optional(),
+        card_id: z.string().optional(),
+      }),
+      parametersJsonSchema: toJsonSchema(
+        {
+          limit: { type: 'number', description: 'Max number to return (default 10)' },
+          transaction_ref: { type: 'string', description: 'Only cases linked to this transaction reference' },
+          card_id: { type: 'string', description: 'Only cases linked to this card' },
+        },
+        [],
+      ),
       idempotent: true,
       handler: async (ctx, args) => {
-        const rows = await tickets.findAllForCustomer(requireCustomerId(ctx), { take: args.limit ?? 10 });
+        const customerId = requireCustomerId(ctx);
+        let transactionId: string | undefined;
+        if (args.transaction_ref) {
+          const txn = await transactions.findByRefForCustomer(args.transaction_ref, customerId);
+          transactionId = txn.id;
+        }
+        const rows = await tickets.findAllForCustomer(customerId, {
+          take: args.limit ?? 10,
+          transactionId,
+          cardId: args.card_id,
+        });
         return {
-          cases: rows.map((t) => ({ caseId: t.ticketNumber, category: t.category, status: t.status, priority: t.priority, createdAt: t.createdAt })),
+          cases: rows.map((t) => ({
+            caseId: t.ticketNumber,
+            category: t.category,
+            subcategory: t.subcategory ?? undefined,
+            status: t.status,
+            priority: t.priority,
+            createdAt: t.createdAt,
+            disputeAmount: t.disputeAmount ? Number(t.disputeAmount) : undefined,
+            transactionRef: t.transaction?.transactionRef,
+            cardNumberMasked: t.card?.cardNumberMasked,
+          })),
         };
+      },
+    },
+    {
+      name: 'add_case_information',
+      description:
+        "Add information to an existing support case — e.g. a receipt reference, more details the customer " +
+        "wants to provide, or an answer to what the case was waiting on. Refused on a case that's already " +
+        'resolved/closed.',
+      inputSchema: z.object({ case_id: z.string(), information: z.string() }),
+      parametersJsonSchema: toJsonSchema(
+        {
+          case_id: { type: 'string', description: 'The case ID, e.g. TCK-ABC123' },
+          information: { type: 'string', description: 'The information the customer wants to add' },
+        },
+        ['case_id', 'information'],
+      ),
+      handler: async (ctx, args) => {
+        const customerId = requireCustomerId(ctx);
+        const updated = await tickets.addCustomerMessage(args.case_id, customerId, args.information);
+        return { caseId: updated.ticketNumber, status: updated.status, added: true };
       },
     },
   ];
